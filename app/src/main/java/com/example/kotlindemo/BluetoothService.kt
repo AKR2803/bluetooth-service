@@ -11,11 +11,8 @@ import java.util.UUID
 import java.util.concurrent.Executors
 
 /**
- * Defensive Bluetooth helper: listens, connects, reads/writes bytes and forwards
- * raw received strings to the UI via uiCallback(tag,msg).
- *
- * All Bluetooth calls that may require runtime permissions are guarded with
- * try/catch(SecurityException) so the app doesn't crash if permission is missing.
+ * Minimal networking layer. Defensive: catches SecurityException around all Bluetooth calls
+ * that may require runtime permissions on newer Android releases.
  */
 class BluetoothService(
     private val adapter: BluetoothAdapter,
@@ -68,7 +65,6 @@ class BluetoothService(
                 cleanupActiveSocket()
                 activeSocket = sock
                 startIo(sock)
-                try { uiCallback("CONNECTED", remote) } catch (_: Exception) {}
             } catch (t: Throwable) {
                 log("startServer: unexpected: ${t.message}")
             }
@@ -83,6 +79,7 @@ class BluetoothService(
 
     fun connectTo(device: android.bluetooth.BluetoothDevice) {
         exec.execute {
+            // obtain safe device id for logs without calling protected getters (defensive)
             val devAddr = try { device.address } catch (_: Exception) { "unknown" }
             val devNameSafe = try { device.name } catch (se: SecurityException) { null } catch (_: Exception) { null }
             log("connectTo: connecting to $devAddr / ${devNameSafe ?: "name-unavailable"}")
@@ -108,7 +105,6 @@ class BluetoothService(
                 log("connectTo: connected")
                 activeSocket = sock
                 startIo(sock)
-                try { uiCallback("CONNECTED", devAddr) } catch (_: Exception) {}
             } catch (se: SecurityException) {
                 log("connectTo: SecurityException during connect: ${se.message}")
                 try { sock.close() } catch (_: Exception) {}
@@ -124,15 +120,22 @@ class BluetoothService(
 
     private fun startIo(sock: BluetoothSocket) {
         exec.execute {
-            val input: InputStream? = try { sock.inputStream } catch (se: SecurityException) {
-                log("startIo: inputStream SecurityException: ${se.message}"); null
-            } catch (e: Exception) { log("startIo: inputStream error: ${e.message}"); null }
+            var input: InputStream? = null
+            var output: OutputStream? = null
+            try {
+                input = try { sock.inputStream } catch (se: SecurityException) {
+                    log("startIo: inputStream SecurityException: ${se.message}"); null
+                } catch (e: Exception) { log("startIo: inputStream error: ${e.message}"); null }
+                output = try { sock.outputStream } catch (se: SecurityException) {
+                    log("startIo: outputStream SecurityException: ${se.message}"); null
+                } catch (e: Exception) { log("startIo: outputStream error: ${e.message}"); null }
 
-            val output: OutputStream? = try { sock.outputStream } catch (se: SecurityException) {
-                log("startIo: outputStream SecurityException: ${se.message}"); null
-            } catch (e: Exception) { log("startIo: outputStream error: ${e.message}"); null }
-
-            if (input == null || output == null) {
+                if (input == null || output == null) {
+                    try { sock.close() } catch (_: Exception) {}
+                    return@execute
+                }
+            } catch (t: Throwable) {
+                log("startIo: unexpected stream error: ${t.message}")
                 try { sock.close() } catch (_: Exception) {}
                 return@execute
             }
@@ -157,7 +160,6 @@ class BluetoothService(
                 log("startIo: closing socket")
                 try { sock.close() } catch (_: Exception) {}
                 if (activeSocket === sock) activeSocket = null
-                try { uiCallback("DISCONNECTED", "") } catch (_: Exception) {}
             }
         }
     }
@@ -183,7 +185,6 @@ class BluetoothService(
                 out.write(data)
                 out.flush()
                 log("send: wrote ${data.size} bytes")
-                try { uiCallback("SENT", message) } catch (_: Exception) {}
             } catch (se: SecurityException) {
                 log("send: SecurityException: ${se.message}")
             } catch (io: IOException) {
