@@ -7,6 +7,7 @@ import android.bluetooth.BluetoothManager
 import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
+import android.util.Log
 import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
@@ -98,7 +99,7 @@ class GameViewModel(
     private val adapter: BluetoothAdapter,
     private val btService: BluetoothService
 ) {
-    private val myDeviceId: String = try {
+    val myDeviceId: String = try {
         adapter.address
     } catch (e: SecurityException) {
         "DEVICE_${System.currentTimeMillis()}"
@@ -127,18 +128,28 @@ class GameViewModel(
     
     var gameMessage by mutableStateOf("")
         private set
+    
+    var debugLog by mutableStateOf("")
+        private set
 
     private var isHost = false
-    private var amIPlayer1 = false
 
     init {
         kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.Dispatchers.Main).launch {
             btService.status.collect { connectionStatus = it }
         }
+        addLog("My Device ID: ${myDeviceId.takeLast(8)}")
+    }
+
+    private fun addLog(msg: String) {
+        Log.d("TicTacToe", msg)
+        debugLog = "${System.currentTimeMillis() % 100000}: $msg\n$debugLog"
+        if (debugLog.length > 2000) debugLog = debugLog.take(2000)
     }
 
     fun setRole(isHostDevice: Boolean) {
         isHost = isHostDevice
+        addLog("Role set: ${if (isHost) "HOST" else "CLIENT"}")
     }
 
     fun loadPairedDevices() {
@@ -162,12 +173,14 @@ class GameViewModel(
     }
 
     fun claimFirstTurn(iGoFirst: Boolean) {
-        // Assign player IDs
         player1Id = if (iGoFirst) myDeviceId else (selectedDevice?.address ?: "OPPONENT")
         player2Id = if (iGoFirst) (selectedDevice?.address ?: "OPPONENT") else myDeviceId
         
-        amIPlayer1 = (player1Id == myDeviceId)
-        isMyTurn = amIPlayer1 // Player 1 always starts
+        val amIPlayer1 = (player1Id == myDeviceId)
+        isMyTurn = amIPlayer1
+        
+        addLog("CLAIM: iGoFirst=$iGoFirst, amIPlayer1=$amIPlayer1, isMyTurn=$isMyTurn")
+        addLog("Player1: ${player1Id.takeLast(8)}, Player2: ${player2Id.takeLast(8)}")
         
         val msg = GameMessage(
             gameState = gameState,
@@ -181,8 +194,9 @@ class GameViewModel(
     fun makeMove(row: Int, col: Int) {
         if (!isMyTurn || gameState.board[row][col] != " ") return
 
-        val newBoard = gameState.board.map { it.clone() }.toTypedArray()
+        val amIPlayer1 = (myDeviceId == player1Id)
         val mySymbol = if (amIPlayer1) "X" else "O"
+        val newBoard = gameState.board.map { it.clone() }.toTypedArray()
         newBoard[row][col] = mySymbol
 
         val newTurn = gameState.turn + 1
@@ -196,13 +210,14 @@ class GameViewModel(
             isDraw = isDraw
         )
 
+        addLog("MOVE: [$row,$col]=$mySymbol, turn=$newTurn, switching to opponent")
+        isMyTurn = false
+
         if (winner != null) {
             gameMessage = "Winner: ${if (winner == "X") "Player 1 (X)" else "Player 2 (O)"}"
         } else if (isDraw) {
             gameMessage = "Game is a draw!"
         }
-
-        isMyTurn = false // Immediately disable my turn
 
         val msg = GameMessage(
             gameState = gameState,
@@ -215,33 +230,34 @@ class GameViewModel(
     fun handleIncomingMessage(json: String) {
         val msg = GameMessage.fromJson(json) ?: return
 
-        // Initial role assignment from opponent
+        // Initial role assignment
         if (player1Id.isEmpty() && msg.player1Id.isNotEmpty()) {
             player1Id = msg.player1Id
             player2Id = msg.player2Id
-            amIPlayer1 = (myDeviceId == player1Id)
-            
-            // Only Player 1 has turn at start
+            val amIPlayer1 = (myDeviceId == player1Id)
             isMyTurn = amIPlayer1
+            
+            addLog("RECEIVED ROLES: P1=${player1Id.takeLast(8)}, P2=${player2Id.takeLast(8)}")
+            addLog("amIPlayer1=$amIPlayer1, isMyTurn=$isMyTurn")
             return
         }
 
-        // Update game state from opponent's move
+        // Update game state
         val oldTurn = gameState.turn
         gameState = msg.gameState
         
-        // Only update turn if board actually changed (opponent made a move)
         if (gameState.turn > oldTurn) {
-            // Determine whose turn based on turn number
-            // Turn 0, 2, 4... = Player 1
-            // Turn 1, 3, 5... = Player 2
+            val amIPlayer1 = (myDeviceId == player1Id)
             val shouldBePlayer1Turn = (gameState.turn % 2 == 0)
+            val wasMyTurn = isMyTurn
             isMyTurn = (shouldBePlayer1Turn && amIPlayer1) || (!shouldBePlayer1Turn && !amIPlayer1)
             
-            // Don't allow turns if game is over
             if (gameState.winner.isNotEmpty() || gameState.isDraw) {
                 isMyTurn = false
             }
+            
+            addLog("RECEIVED MOVE: turn=${gameState.turn}, shouldBeP1=$shouldBePlayer1Turn")
+            addLog("amIPlayer1=$amIPlayer1, wasMyTurn=$wasMyTurn, nowMyTurn=$isMyTurn")
         }
 
         if (gameState.winner.isNotEmpty()) {
@@ -258,7 +274,10 @@ class GameViewModel(
     fun resetGame() {
         gameState = GameState()
         gameMessage = ""
-        isMyTurn = amIPlayer1 // Player 1 starts again
+        val amIPlayer1 = (myDeviceId == player1Id)
+        isMyTurn = amIPlayer1
+        
+        addLog("RESET: amIPlayer1=$amIPlayer1, isMyTurn=$isMyTurn")
         
         val msg = GameMessage(
             gameState = gameState.copy(isReset = true),
@@ -285,6 +304,12 @@ class GameViewModel(
         }
         return null
     }
+    
+    fun getCurrentTurnPlayerId(): String {
+        if (player1Id.isEmpty()) return ""
+        val shouldBePlayer1Turn = (gameState.turn % 2 == 0)
+        return if (shouldBePlayer1Turn) player1Id else player2Id
+    }
 }
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -305,6 +330,32 @@ fun GameScreen(
                 .verticalScroll(rememberScrollState()),
             verticalArrangement = Arrangement.spacedBy(12.dp)
         ) {
+            // Device ID Display
+            Card(
+                modifier = Modifier.fillMaxWidth(),
+                colors = CardDefaults.cardColors(containerColor = Color(0xFF2196F3))
+            ) {
+                Column(modifier = Modifier.padding(12.dp)) {
+                    Text(
+                        "My ID: ${viewModel.myDeviceId.takeLast(8)}",
+                        color = Color.White,
+                        style = MaterialTheme.typography.titleMedium
+                    )
+                    if (viewModel.player1Id.isNotEmpty()) {
+                        Text(
+                            "Player 1 (X): ${viewModel.player1Id.takeLast(8)}",
+                            color = Color.White,
+                            style = MaterialTheme.typography.bodySmall
+                        )
+                        Text(
+                            "Player 2 (O): ${viewModel.player2Id.takeLast(8)}",
+                            color = Color.White,
+                            style = MaterialTheme.typography.bodySmall
+                        )
+                    }
+                }
+            }
+
             ConnectionStatusCard(viewModel.connectionStatus)
 
             Row(
@@ -360,6 +411,27 @@ fun GameScreen(
                     onCellClick = { row, col -> viewModel.makeMove(row, col) }
                 )
 
+                // Current Turn Display
+                Card(
+                    modifier = Modifier.fillMaxWidth(),
+                    colors = CardDefaults.cardColors(
+                        containerColor = if (viewModel.isMyTurn) Color(0xFF4CAF50) else Color(0xFFF44336)
+                    )
+                ) {
+                    Column(modifier = Modifier.padding(12.dp)) {
+                        Text(
+                            "Current Turn: ${viewModel.getCurrentTurnPlayerId().takeLast(8)}",
+                            color = Color.White,
+                            style = MaterialTheme.typography.titleMedium
+                        )
+                        Text(
+                            if (viewModel.isMyTurn) "YOUR TURN" else "OPPONENT'S TURN",
+                            color = Color.White,
+                            style = MaterialTheme.typography.bodyLarge
+                        )
+                    }
+                }
+
                 if (viewModel.gameMessage.isNotEmpty()) {
                     Text(
                         text = viewModel.gameMessage,
@@ -373,6 +445,18 @@ fun GameScreen(
                     modifier = Modifier.fillMaxWidth()
                 ) {
                     Text("Reset Game")
+                }
+                
+                // Debug Log
+                Card(modifier = Modifier.fillMaxWidth()) {
+                    Column(modifier = Modifier.padding(8.dp)) {
+                        Text("Debug Log:", style = MaterialTheme.typography.labelSmall)
+                        Text(
+                            viewModel.debugLog,
+                            style = MaterialTheme.typography.bodySmall,
+                            modifier = Modifier.heightIn(max = 150.dp)
+                        )
+                    }
                 }
             }
         }
@@ -461,12 +545,6 @@ fun GameBoard(
         horizontalAlignment = Alignment.CenterHorizontally,
         verticalArrangement = Arrangement.spacedBy(8.dp)
     ) {
-        Text(
-            text = if (isMyTurn) "Your Turn" else "Opponent's Turn",
-            style = MaterialTheme.typography.titleMedium,
-            color = if (isMyTurn) Color(0xFF4CAF50) else Color(0xFFF44336)
-        )
-        
         for (row in 0..2) {
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 for (col in 0..2) {
