@@ -63,6 +63,9 @@ data class GameMessage(
     }
 
     companion object {
+        // turns JSON into a GameMessage (needs no existing object), similar to using static methods in Java
+        // we do not need to instantiate this class object to use this, actually this will itself create one!
+        // it is helpful as when we are reading JSON data, we do not have the GameMessage yet
         fun fromJsonString(s: String): GameMessage? {
             try {
                 val root = JSONObject(s)

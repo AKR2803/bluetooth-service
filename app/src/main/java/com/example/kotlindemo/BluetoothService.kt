@@ -43,6 +43,7 @@ class BluetoothService(
                 }
                 logs.tryEmit("startServer: listening")
                 status.value = "LISTENING"
+                // create a bluetooth socket with Service Record
                 serverSocket = adapter.listenUsingRfcommWithServiceRecord("KotlinDemo", SPP_UUID)
                 val sock = serverSocket?.accept() // blocks
                 if (sock != null) {
@@ -138,7 +139,7 @@ class BluetoothService(
             socket = null
             serverSocket = null
             status.value = "DISCONNECTED"
-            logs.tryEmit("stopAll: stopped")
+            logs.tryEmit("stopAll triggered: stopped")
         }
     }
 }

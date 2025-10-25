@@ -43,7 +43,7 @@ class MainActivity : ComponentActivity() {
     private lateinit var btService: BluetoothService
 
     // UI state
-    private var paired by mutableStateOf<List<BluetoothDevice>>(emptyList())
+    private var pairedDevices by mutableStateOf<List<BluetoothDevice>>(emptyList())
     private var selectedAddr by mutableStateOf<String?>(null)
     private var logs by mutableStateOf("")
     private var incomingText by mutableStateOf("")
@@ -63,7 +63,7 @@ class MainActivity : ComponentActivity() {
     private var turnCounter by mutableStateOf(0)
     private var allowLocalMoves by mutableStateOf(false)
 
-    // permission launcher for S+ connect
+    // permission launcher
     private val requestPerms = registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) {}
 
     @RequiresPermission("android.permission.LOCAL_MAC_ADDRESS")
@@ -80,7 +80,7 @@ class MainActivity : ComponentActivity() {
 
         btService = BluetoothService(this, btAdapter)
 
-        // collect logs & incoming messages
+        // collectingn logs and incoming messages
         lifecycleScope.launchWhenStarted {
             btService.logs.collectLatest { l -> logs += l + "\n" }
         }
@@ -98,71 +98,102 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun refreshPaired() {
+        // if adapter is null simply return
         val a = adapter ?: return
         try {
             val set = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S &&
                 ContextCompat.checkSelfPermission(this, Manifest.permission.BLUETOOTH_CONNECT) != PackageManager.PERMISSION_GRANTED) {
-                // missing permission — show empty list
+                // if permissions are missing, display empty list
                 listOf<BluetoothDevice>()
             } else {
+                // otherwise, get the list of pairedDevices Bluetooth devices
                 a.bondedDevices.toList()
             }
-            paired = set.sortedBy { try { it.name ?: it.address } catch (_: Exception) { it.address } }
-        } catch (se: SecurityException) {
+            // sort by name, and if name is null or something else fails, sort by address (as in the catch block)
+            pairedDevices = set.sortedBy { try { it.name ?: it.address } catch (_: Exception) { it.address } }
+        } 
+        // if permission missing/denied display a toast 
+        catch (se: SecurityException) {
             Toast.makeText(this, "Permission denied reading bonded devices", Toast.LENGTH_SHORT).show()
-            paired = emptyList()
+            pairedDevices = emptyList()
         }
     }
 
+    // 🐛 bug in this method probably how it handles the ids for player1 and player2
     private fun handleIncoming(raw: String) {
         val gm = GameMessage.fromJsonString(raw) ?: return
-        // handshake: incoming claim (player1Choice set, player2Choice empty)
         val mg = gm.miniGame
+
         if (mg.player1Choice.isNotEmpty() && mg.player2Choice.isEmpty()) {
-            // recipient: set mapping and reply with confirmation including choices ordered
             val claimed = mg.player1Choice
-            // set oppId if unknown
-            if (oppId.isBlank() && claimed != myId) oppId = claimed
-            // set mapping: player1 = claimed, player2 = other
+
+            // ensuring `oppId` is set correctly as the other player(i.e. the opponent)
             player1Id = claimed
             player2Id = if (claimed == myId) oppId else myId
+
+            // important: ensure `oppId` is updated for future use if it was blank
+            // IMPORTANT ⚠️⚠️⚠️
+            if (oppId.isBlank()) {
+                oppId = if (myId == player1Id) player2Id else player1Id
+            }
+
             amPlayer1 = (myId == player1Id)
             handshakeCompleted = true
             allowLocalMoves = (turnCounter % 2 == 0 && myId == player1Id)
+
             // send confirmation
             val confirm = GameMessage(
-                gameState = GameState(Array(3) { Array(3) { " " } }, "0", " ", false, true, false),
-                choices = listOf(Choice("player1", player1Id), Choice("player2", player2Id)),
-                miniGame = MiniGame(player1Id, player1Id)
+                gameState = GameState(
+                    board= Array(3) { Array(3) { " " } },
+                    turn="0",
+                    winner=" ",
+                    draw=false,
+                    connectionEstablished= true,
+                    reset = false
+                ),
+                choices = listOf(
+                    Choice("player1", player1Id),
+                    Choice("player2", player2Id)
+                ),
+                miniGame = MiniGame(player1Id, player2Id)
             )
             btService.sendJson(confirm.toJsonString())
             return
         }
 
-        // confirmation: both set -> the sender receives this
+        // --- CONFIRMATION: BOTH SET (Sender's side) ---
         if (mg.player1Choice.isNotEmpty() && mg.player2Choice.isNotEmpty()) {
-            // use choices ordering if available
-            val p1 = gm.choices.getOrNull(0)?.name ?: mg.player1Choice
-            val p2 = gm.choices.getOrNull(1)?.name ?: if (p1 == myId) oppId else myId
-            player1Id = p1
-            player2Id = p2
+            // use MiniGame fields as they were set by the recipient
+            player1Id = mg.player1Choice
+            player2Id = mg.player2Choice
+
             amPlayer1 = (myId == player1Id)
+
+            // IMPORTANT ⚠️⚠️⚠️: Set oppId based on confirmed roles
+            oppId = if (myId == player1Id) player2Id else player1Id
+
             handshakeCompleted = true
             pendingClaimId = null
+
             // starter moves when turn == 0
             allowLocalMoves = (turnCounter % 2 == 0 && myId == player1Id)
             return
         }
 
-        // normal game update: apply board, turn and mapping if present
+        // using the `name` field for the ID
         val p1id = gm.choices.getOrNull(0)?.name ?: ""
         val p2id = gm.choices.getOrNull(1)?.name ?: ""
+
         if (p1id.isNotEmpty() && p2id.isNotEmpty()) {
-            player1Id = p1id; player2Id = p2id; amPlayer1 = (myId == player1Id)
+            player1Id = p1id
+            player2Id = p2id
+            amPlayer1 = (myId == player1Id)
         }
+
         boardState = copyBoard(gm.gameState.board)
         turnCounter = gm.gameState.turn.toIntOrNull() ?: turnCounter
-        // enable local moves only if current player (by parity) equals myId
+
+        // Final Turn Check: enable local moves only if current player (by parity) equals myId
         val currentPlayer = if (turnCounter % 2 == 0) player1Id else player2Id
         allowLocalMoves = (currentPlayer == myId)
     }
@@ -187,15 +218,18 @@ class MainActivity : ComponentActivity() {
     @Composable
     fun AppContent() {
         var showWhoDialog by remember { mutableStateOf(false) }
-        val verticalScrollState = rememberScrollState()
-        val buttonRowScroll = rememberScrollState() // Still useful for smaller screens or future buttons
+
+        val screenScroll = rememberScrollState()
+        val buttonRowScroll = rememberScrollState()
+        val logsScroll = rememberScrollState()
+        val incomingScroll = rememberScrollState()
 
         Scaffold(topBar = { TopAppBar(title = { Text("TicTacToe - Responsive UI") }) }) { padding ->
             Column(
                 Modifier
                     .padding(padding)
                     .padding(12.dp)
-                    .verticalScroll(verticalScrollState), // <-- page scrollable
+                    .verticalScroll(screenScroll),
                 verticalArrangement = Arrangement.spacedBy(10.dp)
             ) {
                 Text("MyId: $myId  OppId: ${oppId.ifBlank { "none" }}")
@@ -222,7 +256,7 @@ class MainActivity : ComponentActivity() {
                         refreshPaired()
                     }) { Text("Show Paired") }
                     Button(onClick = {
-                        val dev = paired.firstOrNull { it.address == selectedAddr }
+                        val dev = pairedDevices.firstOrNull { it.address == selectedAddr }
                         if (dev != null) {
                             oppId = try { dev.address } catch (_: Exception) { oppId }
                             btService.connectTo(dev)
@@ -251,8 +285,10 @@ class MainActivity : ComponentActivity() {
 
                 // ... rest of AppContent remains the same
                 Text("Paired devices (tap to select) — scroll if many:")
-                LazyColumn(modifier = Modifier.fillMaxWidth().heightIn(max = 200.dp)) {
-                    items(paired) { d ->
+                LazyColumn(modifier = Modifier
+                    .fillMaxWidth()
+                    .heightIn(max = 200.dp)) {
+                    items(pairedDevices) { d ->
                         val name = try { d.name ?: "Unknown" } catch (_: Exception) { "Unknown" }
                         Row(
                             Modifier
@@ -287,7 +323,9 @@ class MainActivity : ComponentActivity() {
                                         modifier = Modifier
                                             .size(cellSize)
                                             .clickable(enabled = allowLocalMoves && cell == " ") {
-                                                if (!handshakeCompleted) { logs += "Move blocked: handshake not complete\n"; return@clickable }
+                                                if (!handshakeCompleted) {
+                                                    logs += "Move blocked: handshake not complete\n"; return@clickable
+                                                }
                                                 val mySymbol = if (myId == player1Id) "X" else "O"
                                                 boardState = copyBoard(boardState)
                                                 boardState[r][c] = mySymbol
@@ -296,9 +334,22 @@ class MainActivity : ComponentActivity() {
                                                 if (w != null) logs += "Local winner: $w\n"
                                                 allowLocalMoves = false
                                                 val gm = GameMessage(
-                                                    gameState = GameState(boardState, turnCounter.toString(), " ", false, true, false),
-                                                    choices = listOf(Choice("player1", player1Id), Choice("player2", player2Id)),
-                                                    miniGame = MiniGame(player1Id, player1Id)
+                                                    gameState = GameState(
+                                                        boardState,
+                                                        turnCounter.toString(),
+                                                        " ",
+                                                        false,
+                                                        true,
+                                                        false
+                                                    ),
+                                                    choices = listOf(
+                                                        Choice("player1", player1Id),
+                                                        Choice("player2", player2Id)
+                                                    ),
+                                                    miniGame = MiniGame(
+                                                        "",
+                                                        ""
+                                                    ) // <-- FIX 5: miniGame is empty for normal move
                                                 )
                                                 btService.sendJson(gm.toJsonString())
                                             },
@@ -318,10 +369,16 @@ class MainActivity : ComponentActivity() {
                 HorizontalDivider()
 
                 Text("Logs:")
-                Surface(Modifier.fillMaxWidth().heightIn(min = 80.dp, max = 200.dp).padding(4.dp)) { Text(logs) }
+                Surface(Modifier
+                    .fillMaxWidth()
+                    .heightIn(min = 80.dp, max = 200.dp)
+                    .padding(4.dp)) { Text(logs, modifier = Modifier.verticalScroll(logsScroll)) }
                 Spacer(modifier = Modifier.height(8.dp))
                 Text("Incoming raw:")
-                Surface(Modifier.fillMaxWidth().heightIn(min = 80.dp, max = 200.dp).padding(4.dp)) { Text(incomingText) }
+                Surface(Modifier
+                    .fillMaxWidth()
+                    .heightIn(min = 80.dp, max = 200.dp)
+                    .padding(4.dp)) { Text(incomingText, modifier = Modifier.verticalScroll(incomingScroll)) }
 
                 Spacer(modifier = Modifier.height(24.dp)) // small bottom padding when scrolled
             }
@@ -336,6 +393,7 @@ class MainActivity : ComponentActivity() {
                         pendingClaimId = myId
                         val gm = GameMessage(
                             GameState(Array(3) { Array(3) { " " } }, "0", " ", false, true, false),
+                            // FIX 2: Correctly list choices (myId is Player 1/X)
                             listOf(Choice("player1", myId), Choice("player2", oppId)),
                             MiniGame(myId, "")
                         )
@@ -349,7 +407,8 @@ class MainActivity : ComponentActivity() {
                         pendingClaimId = oppId
                         val gm = GameMessage(
                             GameState(Array(3) { Array(3) { " " } }, "0", " ", false, true, false),
-                            listOf(Choice("player1", myId), Choice("player2", oppId)),
+                            // FIX 3: Correctly list choices (oppId is Player 1/X)
+                            listOf(Choice("player1", oppId), Choice("player2", myId)),
                             MiniGame(oppId, "")
                         )
                         btService.sendJson(gm.toJsonString())
