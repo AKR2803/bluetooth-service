@@ -7,8 +7,6 @@ import android.bluetooth.BluetoothManager
 import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
-import android.util.Log
-import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
@@ -24,7 +22,10 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import androidx.lifecycle.lifecycleScope
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.launch
@@ -45,9 +46,7 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        val btAdapter = adapter
-        if (btAdapter == null) {
-            Toast.makeText(this, "Bluetooth not supported", Toast.LENGTH_LONG).show()
+        val btAdapter = adapter ?: run {
             finish()
             return
         }
@@ -125,10 +124,10 @@ class GameViewModel(
     var isMyTurn by mutableStateOf(false)
         private set
     
-    var gameMessage by mutableStateOf("")
+    var winnerSymbol by mutableStateOf("")
         private set
     
-    var debugLog by mutableStateOf("")
+    var showGameOver by mutableStateOf(false)
         private set
 
     private var isHost = false
@@ -138,19 +137,11 @@ class GameViewModel(
         kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.Dispatchers.Main).launch {
             btService.status.collect { connectionStatus = it }
         }
-        addLog("My Device ID: $myDeviceId")
-    }
-
-    private fun addLog(msg: String) {
-        Log.d("TicTacToe", msg)
-        debugLog = "${System.currentTimeMillis() % 100000}: $msg\n$debugLog"
-        if (debugLog.length > 2000) debugLog = debugLog.take(2000)
     }
 
     fun setConnection(isHostDevice: Boolean, remoteAddress: String) {
         isHost = isHostDevice
         opponentId = remoteAddress.takeLast(8)
-        addLog("Connected: ${if (isHost) "HOST" else "CLIENT"}, Opponent: $opponentId")
     }
 
     fun loadPairedDevices() {
@@ -177,11 +168,7 @@ class GameViewModel(
         player1Id = if (iGoFirst) myDeviceId else opponentId
         player2Id = if (iGoFirst) opponentId else myDeviceId
         
-        val amIPlayer1 = (player1Id == myDeviceId)
-        isMyTurn = amIPlayer1
-        
-        addLog("CLAIM: iGoFirst=$iGoFirst, amIPlayer1=$amIPlayer1, isMyTurn=$isMyTurn")
-        addLog("Player1: $player1Id, Player2: $player2Id")
+        isMyTurn = (player1Id == myDeviceId)
         
         val msg = GameMessage(
             gameState = gameState,
@@ -200,24 +187,24 @@ class GameViewModel(
         val newBoard = gameState.board.map { it.clone() }.toTypedArray()
         newBoard[row][col] = mySymbol
 
-        val newTurn = gameState.turn + 1
-        val winner = checkWinner(newBoard)
-        val isDraw = winner == null && newBoard.all { row -> row.all { it != " " } }
+        val loserSymbol = checkLoser(newBoard)
+        val isDraw = loserSymbol == null && newBoard.all { row -> row.all { it != " " } }
 
         gameState = gameState.copy(
             board = newBoard,
-            turn = newTurn,
-            winner = winner ?: "",
+            turn = gameState.turn + 1,
+            winner = if (loserSymbol != null) (if (loserSymbol == "X") "O" else "X") else "",
             isDraw = isDraw
         )
 
-        addLog("MOVE: [$row,$col]=$mySymbol, turn=$newTurn, switching to opponent")
         isMyTurn = false
 
-        if (winner != null) {
-            gameMessage = "Winner: ${if (winner == "X") "Player 1 (X)" else "Player 2 (O)"}"
+        if (loserSymbol != null) {
+            winnerSymbol = if (loserSymbol == "X") "O" else "X"
+            showGameOver = true
         } else if (isDraw) {
-            gameMessage = "Game is a draw!"
+            winnerSymbol = ""
+            showGameOver = true
         }
 
         val msg = GameMessage(
@@ -231,40 +218,26 @@ class GameViewModel(
     fun handleIncomingMessage(json: String) {
         val msg = GameMessage.fromJson(json) ?: return
 
-        // Initial role assignment
         if (player1Id.isEmpty() && msg.player1Id.isNotEmpty()) {
             player1Id = msg.player1Id
             player2Id = msg.player2Id
-            val amIPlayer1 = (myDeviceId == player1Id)
-            isMyTurn = amIPlayer1
-            
-            addLog("RECEIVED ROLES: P1=$player1Id, P2=$player2Id")
-            addLog("amIPlayer1=$amIPlayer1, isMyTurn=$isMyTurn")
+            isMyTurn = (myDeviceId == player1Id)
             return
         }
 
-        // Update game state
         val oldTurn = gameState.turn
         gameState = msg.gameState
         
         if (gameState.turn > oldTurn) {
             val amIPlayer1 = (myDeviceId == player1Id)
             val shouldBePlayer1Turn = (gameState.turn % 2 == 0)
-            val wasMyTurn = isMyTurn
             isMyTurn = (shouldBePlayer1Turn && amIPlayer1) || (!shouldBePlayer1Turn && !amIPlayer1)
             
             if (gameState.winner.isNotEmpty() || gameState.isDraw) {
                 isMyTurn = false
+                winnerSymbol = gameState.winner
+                showGameOver = true
             }
-            
-            addLog("RECEIVED MOVE: turn=${gameState.turn}, shouldBeP1=$shouldBePlayer1Turn")
-            addLog("amIPlayer1=$amIPlayer1, wasMyTurn=$wasMyTurn, nowMyTurn=$isMyTurn")
-        }
-
-        if (gameState.winner.isNotEmpty()) {
-            gameMessage = "Winner: ${if (gameState.winner == "X") "Player 1 (X)" else "Player 2 (O)"}"
-        } else if (gameState.isDraw) {
-            gameMessage = "Game is a draw!"
         }
 
         if (gameState.isReset) {
@@ -274,11 +247,9 @@ class GameViewModel(
 
     fun resetGame() {
         gameState = GameState()
-        gameMessage = ""
-        val amIPlayer1 = (myDeviceId == player1Id)
-        isMyTurn = amIPlayer1
-        
-        addLog("RESET: amIPlayer1=$amIPlayer1, isMyTurn=$isMyTurn")
+        winnerSymbol = ""
+        showGameOver = false
+        isMyTurn = (myDeviceId == player1Id)
         
         val msg = GameMessage(
             gameState = gameState.copy(isReset = true),
@@ -288,15 +259,18 @@ class GameViewModel(
         btService.sendMessage(msg.toJson())
     }
 
-    private fun checkWinner(board: Array<Array<String>>): String? {
+    private fun checkLoser(board: Array<Array<String>>): String? {
+        // Check rows
         for (row in board) {
             if (row[0] != " " && row[0] == row[1] && row[1] == row[2]) return row[0]
         }
+        // Check columns
         for (col in 0..2) {
             if (board[0][col] != " " && board[0][col] == board[1][col] && board[1][col] == board[2][col]) {
                 return board[0][col]
             }
         }
+        // Check diagonals
         if (board[0][0] != " " && board[0][0] == board[1][1] && board[1][1] == board[2][2]) {
             return board[0][0]
         }
@@ -311,6 +285,12 @@ class GameViewModel(
         val shouldBePlayer1Turn = (gameState.turn % 2 == 0)
         return if (shouldBePlayer1Turn) player1Id else player2Id
     }
+    
+    fun getWinnerName(): String {
+        if (winnerSymbol.isEmpty()) return ""
+        val winnerId = if (winnerSymbol == "X") player1Id else player2Id
+        return if (winnerId == myDeviceId) "You" else "Opponent"
+    }
 }
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -322,143 +302,145 @@ fun GameScreen(
     var showTurnDialog by remember { mutableStateOf(false) }
 
     Scaffold(
-        topBar = { TopAppBar(title = { Text("Tic-Tac-Toe Bluetooth") }) }
+        topBar = { TopAppBar(title = { Text("Misère Tic-Tac-Toe") }) }
     ) { padding ->
-        Column(
-            modifier = Modifier
-                .padding(padding)
-                .padding(16.dp)
-                .verticalScroll(rememberScrollState()),
-            verticalArrangement = Arrangement.spacedBy(12.dp)
-        ) {
-            // Device ID Display
-            Card(
-                modifier = Modifier.fillMaxWidth(),
-                colors = CardDefaults.cardColors(containerColor = Color(0xFF2196F3))
+        Box(modifier = Modifier.fillMaxSize()) {
+            Column(
+                modifier = Modifier
+                    .padding(padding)
+                    .padding(16.dp)
+                    .verticalScroll(rememberScrollState()),
+                verticalArrangement = Arrangement.spacedBy(12.dp)
             ) {
-                Column(modifier = Modifier.padding(12.dp)) {
-                    Text(
-                        "My ID: ${viewModel.myDeviceId}",
-                        color = Color.White,
-                        style = MaterialTheme.typography.titleMedium
-                    )
-                    if (viewModel.player1Id.isNotEmpty()) {
-                        Text(
-                            "Player 1 (X): ${viewModel.player1Id}",
-                            color = Color.White,
-                            style = MaterialTheme.typography.bodySmall
-                        )
-                        Text(
-                            "Player 2 (O): ${viewModel.player2Id}",
-                            color = Color.White,
-                            style = MaterialTheme.typography.bodySmall
-                        )
-                    }
-                }
-            }
-
-            ConnectionStatusCard(viewModel.connectionStatus)
-
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.spacedBy(8.dp)
-            ) {
-                Button(
-                    onClick = { viewModel.startServer() },
-                    modifier = Modifier.weight(1f)
-                ) {
-                    Text("Host Game")
-                }
-                Button(
-                    onClick = {
-                        onRequestPermissions()
-                        viewModel.loadPairedDevices()
-                    },
-                    modifier = Modifier.weight(1f)
-                ) {
-                    Text("Join Game")
-                }
-            }
-
-            if (viewModel.pairedDevices.isNotEmpty()) {
-                DeviceList(
-                    devices = viewModel.pairedDevices,
-                    selectedDevice = viewModel.selectedDevice,
-                    onDeviceSelected = { viewModel.selectDevice(it) }
-                )
-                
-                Button(
-                    onClick = { viewModel.connectToSelected() },
-                    modifier = Modifier.fillMaxWidth(),
-                    enabled = viewModel.selectedDevice != null
-                ) {
-                    Text("Connect")
-                }
-            }
-
-            if (viewModel.connectionStatus is ConnectionStatus.Connected) {
-                Button(
-                    onClick = { showTurnDialog = true },
-                    modifier = Modifier.fillMaxWidth()
-                ) {
-                    Text("Start Game")
-                }
-            }
-
-            if (viewModel.player1Id.isNotEmpty()) {
-                GameBoard(
-                    gameState = viewModel.gameState,
-                    isMyTurn = viewModel.isMyTurn,
-                    onCellClick = { row, col -> viewModel.makeMove(row, col) }
-                )
-
-                // Current Turn Display
                 Card(
                     modifier = Modifier.fillMaxWidth(),
-                    colors = CardDefaults.cardColors(
-                        containerColor = if (viewModel.isMyTurn) Color(0xFF4CAF50) else Color(0xFFF44336)
-                    )
+                    colors = CardDefaults.cardColors(containerColor = Color(0xFF2196F3))
                 ) {
                     Column(modifier = Modifier.padding(12.dp)) {
                         Text(
-                            "Current Turn: ${viewModel.getCurrentTurnPlayerId()}",
+                            "My ID: ${viewModel.myDeviceId}",
                             color = Color.White,
                             style = MaterialTheme.typography.titleMedium
                         )
-                        Text(
-                            if (viewModel.isMyTurn) "YOUR TURN" else "OPPONENT'S TURN",
-                            color = Color.White,
-                            style = MaterialTheme.typography.bodyLarge
-                        )
+                        if (viewModel.player1Id.isNotEmpty()) {
+                            Text(
+                                "Player 1 (X): ${viewModel.player1Id}",
+                                color = Color.White,
+                                style = MaterialTheme.typography.bodySmall
+                            )
+                            Text(
+                                "Player 2 (O): ${viewModel.player2Id}",
+                                color = Color.White,
+                                style = MaterialTheme.typography.bodySmall
+                            )
+                        }
                     }
                 }
 
-                if (viewModel.gameMessage.isNotEmpty()) {
-                    Text(
-                        text = viewModel.gameMessage,
-                        style = MaterialTheme.typography.headlineSmall,
-                        color = MaterialTheme.colorScheme.primary
-                    )
-                }
+                ConnectionStatusCard(viewModel.connectionStatus)
 
-                Button(
-                    onClick = { viewModel.resetGame() },
-                    modifier = Modifier.fillMaxWidth()
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
-                    Text("Reset Game")
-                }
-                
-                // Debug Log
-                Card(modifier = Modifier.fillMaxWidth()) {
-                    Column(modifier = Modifier.padding(8.dp)) {
-                        Text("Debug Log:", style = MaterialTheme.typography.labelSmall)
-                        Text(
-                            viewModel.debugLog,
-                            style = MaterialTheme.typography.bodySmall,
-                            modifier = Modifier.heightIn(max = 150.dp)
-                        )
+                    Button(
+                        onClick = { viewModel.startServer() },
+                        modifier = Modifier.weight(1f)
+                    ) {
+                        Text("Host Game")
+                    }
+                    Button(
+                        onClick = {
+                            onRequestPermissions()
+                            viewModel.loadPairedDevices()
+                        },
+                        modifier = Modifier.weight(1f)
+                    ) {
+                        Text("Join Game")
                     }
                 }
+
+                if (viewModel.pairedDevices.isNotEmpty()) {
+                    DeviceList(
+                        devices = viewModel.pairedDevices,
+                        selectedDevice = viewModel.selectedDevice,
+                        onDeviceSelected = { viewModel.selectDevice(it) }
+                    )
+                    
+                    Button(
+                        onClick = { viewModel.connectToSelected() },
+                        modifier = Modifier.fillMaxWidth(),
+                        enabled = viewModel.selectedDevice != null
+                    ) {
+                        Text("Connect")
+                    }
+                }
+
+                if (viewModel.connectionStatus is ConnectionStatus.Connected) {
+                    Button(
+                        onClick = { showTurnDialog = true },
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Text("Start Game")
+                    }
+                }
+
+                if (viewModel.player1Id.isNotEmpty()) {
+                    Card(
+                        modifier = Modifier.fillMaxWidth(),
+                        colors = CardDefaults.cardColors(containerColor = Color(0xFFFFF3E0))
+                    ) {
+                        Text(
+                            "⚠️ Misère Rules: Don't make 3 in a row! The player who completes a line LOSES!",
+                            modifier = Modifier.padding(12.dp),
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = Color(0xFFE65100)
+                        )
+                    }
+                    
+                    GameBoard(
+                        gameState = viewModel.gameState,
+                        isMyTurn = viewModel.isMyTurn,
+                        onCellClick = { row, col -> viewModel.makeMove(row, col) }
+                    )
+
+                    Card(
+                        modifier = Modifier.fillMaxWidth(),
+                        colors = CardDefaults.cardColors(
+                            containerColor = if (viewModel.isMyTurn) Color(0xFF4CAF50) else Color(0xFFF44336)
+                        )
+                    ) {
+                        Column(modifier = Modifier.padding(12.dp)) {
+                            Text(
+                                "Current Turn: ${viewModel.getCurrentTurnPlayerId()}",
+                                color = Color.White,
+                                style = MaterialTheme.typography.titleMedium
+                            )
+                            Text(
+                                if (viewModel.isMyTurn) "YOUR TURN" else "OPPONENT'S TURN",
+                                color = Color.White,
+                                style = MaterialTheme.typography.bodyLarge
+                            )
+                        }
+                    }
+
+                    Button(
+                        onClick = { viewModel.resetGame() },
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Text("Reset Game")
+                    }
+                }
+            }
+
+            // Game Over Overlay
+            if (viewModel.showGameOver) {
+                GameOverDialog(
+                    isDraw = viewModel.gameState.isDraw,
+                    winnerName = viewModel.getWinnerName(),
+                    winnerSymbol = viewModel.winnerSymbol,
+                    onDismiss = { viewModel.resetGame() }
+                )
             }
         }
     }
@@ -471,6 +453,89 @@ fun GameScreen(
                 showTurnDialog = false
             }
         )
+    }
+}
+
+@Composable
+fun GameOverDialog(
+    isDraw: Boolean,
+    winnerName: String,
+    winnerSymbol: String,
+    onDismiss: () -> Unit
+) {
+    Box(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(Color.Black.copy(alpha = 0.7f))
+            .clickable(onClick = onDismiss),
+        contentAlignment = Alignment.Center
+    ) {
+        Card(
+            modifier = Modifier
+                .fillMaxWidth(0.9f)
+                .padding(16.dp),
+            colors = CardDefaults.cardColors(
+                containerColor = if (isDraw) Color(0xFFFF9800) else Color(0xFF4CAF50)
+            )
+        ) {
+            Column(
+                modifier = Modifier.padding(32.dp),
+                horizontalAlignment = Alignment.CenterHorizontally,
+                verticalArrangement = Arrangement.spacedBy(16.dp)
+            ) {
+                Text(
+                    text = if (isDraw) "🤝" else "🎉",
+                    fontSize = 72.sp
+                )
+                
+                Text(
+                    text = if (isDraw) "It's a Draw!" else "Game Over!",
+                    fontSize = 32.sp,
+                    fontWeight = FontWeight.Bold,
+                    color = Color.White,
+                    textAlign = TextAlign.Center
+                )
+                
+                if (!isDraw) {
+                    Text(
+                        text = "$winnerName Win!",
+                        fontSize = 28.sp,
+                        fontWeight = FontWeight.Bold,
+                        color = Color.White,
+                        textAlign = TextAlign.Center
+                    )
+                    
+                    Text(
+                        text = "Symbol: $winnerSymbol",
+                        fontSize = 24.sp,
+                        color = Color.White,
+                        textAlign = TextAlign.Center
+                    )
+                    
+                    Text(
+                        text = if (winnerName == "You") 
+                            "Congratulations! You avoided making 3 in a row!" 
+                        else 
+                            "Opponent won! They forced you to make 3 in a row!",
+                        fontSize = 16.sp,
+                        color = Color.White,
+                        textAlign = TextAlign.Center
+                    )
+                }
+                
+                Spacer(modifier = Modifier.height(8.dp))
+                
+                Button(
+                    onClick = onDismiss,
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = Color.White,
+                        contentColor = if (isDraw) Color(0xFFFF9800) else Color(0xFF4CAF50)
+                    )
+                ) {
+                    Text("Play Again", fontSize = 18.sp, fontWeight = FontWeight.Bold)
+                }
+            }
+        }
     }
 }
 
