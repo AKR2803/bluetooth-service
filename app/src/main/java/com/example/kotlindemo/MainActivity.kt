@@ -60,6 +60,15 @@ class MainActivity : ComponentActivity() {
             }
         }
 
+        // Collect connection status to determine host/client role
+        lifecycleScope.launch {
+            btService.status.collectLatest { status ->
+                if (status is ConnectionStatus.Connected) {
+                    gameViewModel.setRole(status.isHost)
+                }
+            }
+        }
+
         setContent {
             MaterialTheme {
                 GameScreen(
@@ -95,7 +104,7 @@ class GameViewModel(
     private val myDeviceId: String = try {
         adapter.address
     } catch (e: SecurityException) {
-        "UNKNOWN"
+        "UNKNOWN_${System.currentTimeMillis()}" // Fallback unique ID
     }
 
     var pairedDevices by mutableStateOf<List<BluetoothDevice>>(emptyList())
@@ -122,13 +131,19 @@ class GameViewModel(
     var gameMessage by mutableStateOf("")
         private set
 
+    private var isHost by mutableStateOf(false)
+    private var rolesAssigned by mutableStateOf(false)
+
     init {
-        // Observe connection status
         kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.Dispatchers.Main).launch {
             btService.status.collect { status ->
                 connectionStatus = status
             }
         }
+    }
+
+    fun setRole(isHostDevice: Boolean) {
+        isHost = isHostDevice
     }
 
     fun loadPairedDevices() {
@@ -152,13 +167,28 @@ class GameViewModel(
     }
 
     fun claimFirstTurn(iGoFirst: Boolean) {
-        if (iGoFirst) {
-            player1Id = myDeviceId
-            player2Id = selectedDevice?.address ?: ""
+        // Host always assigns roles
+        if (isHost) {
+            if (iGoFirst) {
+                player1Id = myDeviceId
+                player2Id = selectedDevice?.address ?: "OPPONENT"
+            } else {
+                player1Id = selectedDevice?.address ?: "OPPONENT"
+                player2Id = myDeviceId
+            }
         } else {
-            player1Id = selectedDevice?.address ?: ""
-            player2Id = myDeviceId
+            // Client waits for host to assign roles
+            if (iGoFirst) {
+                player1Id = myDeviceId
+                player2Id = "HOST"
+            } else {
+                player1Id = "HOST"
+                player2Id = myDeviceId
+            }
         }
+        
+        rolesAssigned = true
+        isMyTurn = (player1Id == myDeviceId) // Player 1 always goes first
         
         val msg = GameMessage(
             gameState = gameState,
@@ -167,9 +197,6 @@ class GameViewModel(
             claimingPlayerId = player1Id
         )
         btService.sendMessage(msg.toJson())
-        
-        // If I go first, enable my turn
-        isMyTurn = iGoFirst
     }
 
     fun makeMove(row: Int, col: Int) {
@@ -190,10 +217,13 @@ class GameViewModel(
         )
 
         if (winner != null) {
-            gameMessage = "Winner: ${if (winner == "X") "Player 1" else "Player 2"}"
+            gameMessage = "Winner: ${if (winner == "X") "Player 1 (X)" else "Player 2 (O)"}"
         } else if (isDraw) {
             gameMessage = "Game is a draw!"
         }
+
+        // Switch turn immediately after move
+        isMyTurn = false
 
         val msg = GameMessage(
             gameState = gameState,
@@ -201,19 +231,22 @@ class GameViewModel(
             player2Id = player2Id
         )
         btService.sendMessage(msg.toJson())
-        
-        isMyTurn = false
     }
 
     fun handleIncomingMessage(json: String) {
         val msg = GameMessage.fromJson(json) ?: return
 
-        // Handle turn claim
-        if (msg.claimingPlayerId.isNotEmpty() && player1Id.isEmpty()) {
+        // Handle initial role assignment
+        if (!rolesAssigned && msg.claimingPlayerId.isNotEmpty()) {
             player1Id = msg.player1Id
             player2Id = msg.player2Id
+            rolesAssigned = true
             
-            // Confirm the claim
+            // Determine my turn based on role
+            isMyTurn = (myDeviceId == player1Id && msg.gameState.turn == 0) ||
+                       (myDeviceId == player2Id && msg.gameState.turn > 0 && msg.gameState.turn % 2 == 1)
+            
+            // Send confirmation back
             val confirmMsg = GameMessage(
                 gameState = gameState,
                 player1Id = player1Id,
@@ -221,22 +254,25 @@ class GameViewModel(
                 claimingPlayerId = player1Id
             )
             btService.sendMessage(confirmMsg.toJson())
-            
-            // Set turn based on who I am
-            isMyTurn = (myDeviceId == player1Id && msg.gameState.turn == 0)
             return
         }
 
-        // Update game state
+        // Update game state from opponent's move
         gameState = msg.gameState
         
-        // Determine if it's my turn
-        val currentPlayer = if (gameState.turn % 2 == 0) player1Id else player2Id
-        isMyTurn = (currentPlayer == myDeviceId) && gameState.winner.isEmpty() && !gameState.isDraw
+        // Calculate whose turn it is based on turn counter
+        // Turn 0, 2, 4... = Player 1's turn
+        // Turn 1, 3, 5... = Player 2's turn
+        val isPlayer1Turn = (gameState.turn % 2 == 0)
+        val currentPlayerId = if (isPlayer1Turn) player1Id else player2Id
+        
+        isMyTurn = (currentPlayerId == myDeviceId) && 
+                   gameState.winner.isEmpty() && 
+                   !gameState.isDraw
 
         // Handle game end
         if (gameState.winner.isNotEmpty()) {
-            gameMessage = "Winner: ${if (gameState.winner == "X") "Player 1" else "Player 2"}"
+            gameMessage = "Winner: ${if (gameState.winner == "X") "Player 1 (X)" else "Player 2 (O)"}"
         } else if (gameState.isDraw) {
             gameMessage = "Game is a draw!"
         }
@@ -250,7 +286,7 @@ class GameViewModel(
     fun resetGame() {
         gameState = GameState()
         gameMessage = ""
-        isMyTurn = (myDeviceId == player1Id)
+        isMyTurn = (myDeviceId == player1Id) // Player 1 starts again
         
         val msg = GameMessage(
             gameState = gameState.copy(isReset = true),
@@ -315,7 +351,7 @@ fun GameScreen(
                     onClick = { viewModel.startServer() },
                     modifier = Modifier.weight(1f)
                 ) {
-                    Text("Listen")
+                    Text("Host Game")
                 }
                 Button(
                     onClick = {
@@ -324,7 +360,7 @@ fun GameScreen(
                     },
                     modifier = Modifier.weight(1f)
                 ) {
-                    Text("Scan")
+                    Text("Join Game")
                 }
             }
 
@@ -394,20 +430,26 @@ fun GameScreen(
 
 @Composable
 fun ConnectionStatusCard(status: ConnectionStatus) {
+    val (text, color) = when (status) {
+        is ConnectionStatus.Connected -> {
+            val role = if (status.isHost) "Host" else "Client"
+            "Connected ($role)" to Color(0xFF4CAF50)
+        }
+        is ConnectionStatus.Connecting -> "Connecting..." to Color(0xFFFFC107)
+        is ConnectionStatus.Listening -> "Waiting for connection..." to Color(0xFFFFC107)
+        is ConnectionStatus.Disconnected -> "Disconnected" to Color(0xFFF44336)
+        else -> "Idle" to Color(0xFFE0E0E0)
+    }
+    
     Card(
         modifier = Modifier.fillMaxWidth(),
-        colors = CardDefaults.cardColors(
-            containerColor = when (status) {
-                is ConnectionStatus.Connected -> Color(0xFF4CAF50)
-                is ConnectionStatus.Connecting, is ConnectionStatus.Listening -> Color(0xFFFFC107)
-                else -> Color(0xFFE0E0E0)
-            }
-        )
+        colors = CardDefaults.cardColors(containerColor = color)
     ) {
         Text(
-            text = "Status: ${status.javaClass.simpleName}",
+            text = text,
             modifier = Modifier.padding(16.dp),
-            style = MaterialTheme.typography.titleMedium
+            style = MaterialTheme.typography.titleMedium,
+            color = Color.White
         )
     }
 }
@@ -460,7 +502,8 @@ fun GameBoard(
     ) {
         Text(
             text = if (isMyTurn) "Your Turn" else "Opponent's Turn",
-            style = MaterialTheme.typography.titleMedium
+            style = MaterialTheme.typography.titleMedium,
+            color = if (isMyTurn) Color(0xFF4CAF50) else Color(0xFFF44336)
         )
         
         for (row in 0..2) {
@@ -487,7 +530,10 @@ fun GameCell(
         modifier = Modifier
             .size(80.dp)
             .clickable(enabled = enabled, onClick = onClick),
-        elevation = CardDefaults.cardElevation(defaultElevation = 4.dp)
+        elevation = CardDefaults.cardElevation(defaultElevation = 4.dp),
+        colors = CardDefaults.cardColors(
+            containerColor = if (enabled) Color(0xFFE3F2FD) else Color(0xFFF5F5F5)
+        )
     ) {
         Box(
             modifier = Modifier.fillMaxSize(),
@@ -495,7 +541,8 @@ fun GameCell(
         ) {
             Text(
                 text = value,
-                style = MaterialTheme.typography.displayMedium
+                style = MaterialTheme.typography.displayMedium,
+                color = if (value == "X") Color(0xFF2196F3) else Color(0xFFF44336)
             )
         }
     }
