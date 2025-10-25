@@ -17,7 +17,7 @@ sealed class ConnectionStatus {
     object Idle : ConnectionStatus()
     object Listening : ConnectionStatus()
     object Connecting : ConnectionStatus()
-    data class Connected(val isHost: Boolean) : ConnectionStatus() // Track host/client role
+    data class Connected(val isHost: Boolean, val remoteAddress: String) : ConnectionStatus()
     object Disconnected : ConnectionStatus()
 }
 
@@ -46,7 +46,10 @@ class BluetoothService(
                 serverSocket = adapter.listenUsingRfcommWithServiceRecord("TicTacToe", SPP_UUID)
                 val socket = serverSocket?.accept()
                 
-                socket?.let { onConnected(it, isHost = true) } // Server is host
+                socket?.let { 
+                    val remoteAddr = try { it.remoteDevice.address } catch (e: Exception) { "UNKNOWN" }
+                    onConnected(it, isHost = true, remoteAddr)
+                }
             } catch (e: IOException) {
                 _status.value = ConnectionStatus.Disconnected
             } finally {
@@ -66,17 +69,18 @@ class BluetoothService(
                 
                 val socket = device.createRfcommSocketToServiceRecord(SPP_UUID)
                 socket.connect()
-                onConnected(socket, isHost = false) // Client is not host
+                val remoteAddr = try { device.address } catch (e: Exception) { "UNKNOWN" }
+                onConnected(socket, isHost = false, remoteAddr)
             } catch (e: IOException) {
                 _status.value = ConnectionStatus.Disconnected
             }
         }
     }
 
-    private fun onConnected(socket: BluetoothSocket, isHost: Boolean) {
+    private fun onConnected(socket: BluetoothSocket, isHost: Boolean, remoteAddress: String) {
         clientSocket?.close()
         clientSocket = socket
-        _status.value = ConnectionStatus.Connected(isHost)
+        _status.value = ConnectionStatus.Connected(isHost, remoteAddress)
         startListening(socket)
     }
 

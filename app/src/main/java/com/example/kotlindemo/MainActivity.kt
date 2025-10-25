@@ -28,6 +28,7 @@ import androidx.compose.ui.unit.dp
 import androidx.lifecycle.lifecycleScope
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.launch
+import java.util.UUID
 
 class MainActivity : ComponentActivity() {
     private lateinit var btService: BluetoothService
@@ -52,7 +53,7 @@ class MainActivity : ComponentActivity() {
         }
 
         btService = BluetoothService(this, btAdapter)
-        gameViewModel = GameViewModel(btAdapter, btService)
+        gameViewModel = GameViewModel(btService)
 
         lifecycleScope.launch {
             btService.incomingMessages.collectLatest { msg ->
@@ -62,8 +63,11 @@ class MainActivity : ComponentActivity() {
 
         lifecycleScope.launch {
             btService.status.collectLatest { status ->
-                if (status is ConnectionStatus.Connected) {
-                    gameViewModel.setRole(status.isHost)
+                when (status) {
+                    is ConnectionStatus.Connected -> {
+                        gameViewModel.setConnection(status.isHost, status.remoteAddress)
+                    }
+                    else -> {}
                 }
             }
         }
@@ -96,14 +100,9 @@ class MainActivity : ComponentActivity() {
 }
 
 class GameViewModel(
-    private val adapter: BluetoothAdapter,
     private val btService: BluetoothService
 ) {
-    val myDeviceId: String = try {
-        adapter.address
-    } catch (e: SecurityException) {
-        "DEVICE_${System.currentTimeMillis()}"
-    }
+    val myDeviceId: String = UUID.randomUUID().toString().take(8)
 
     var pairedDevices by mutableStateOf<List<BluetoothDevice>>(emptyList())
         private set
@@ -133,12 +132,13 @@ class GameViewModel(
         private set
 
     private var isHost = false
+    private var opponentId = ""
 
     init {
         kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.Dispatchers.Main).launch {
             btService.status.collect { connectionStatus = it }
         }
-        addLog("My Device ID: ${myDeviceId.takeLast(8)}")
+        addLog("My Device ID: $myDeviceId")
     }
 
     private fun addLog(msg: String) {
@@ -147,14 +147,15 @@ class GameViewModel(
         if (debugLog.length > 2000) debugLog = debugLog.take(2000)
     }
 
-    fun setRole(isHostDevice: Boolean) {
+    fun setConnection(isHostDevice: Boolean, remoteAddress: String) {
         isHost = isHostDevice
-        addLog("Role set: ${if (isHost) "HOST" else "CLIENT"}")
+        opponentId = remoteAddress.takeLast(8)
+        addLog("Connected: ${if (isHost) "HOST" else "CLIENT"}, Opponent: $opponentId")
     }
 
     fun loadPairedDevices() {
         try {
-            pairedDevices = adapter.bondedDevices.toList()
+            pairedDevices = btService.adapter.bondedDevices.toList()
         } catch (e: SecurityException) {
             pairedDevices = emptyList()
         }
@@ -173,14 +174,14 @@ class GameViewModel(
     }
 
     fun claimFirstTurn(iGoFirst: Boolean) {
-        player1Id = if (iGoFirst) myDeviceId else (selectedDevice?.address ?: "OPPONENT")
-        player2Id = if (iGoFirst) (selectedDevice?.address ?: "OPPONENT") else myDeviceId
+        player1Id = if (iGoFirst) myDeviceId else opponentId
+        player2Id = if (iGoFirst) opponentId else myDeviceId
         
         val amIPlayer1 = (player1Id == myDeviceId)
         isMyTurn = amIPlayer1
         
         addLog("CLAIM: iGoFirst=$iGoFirst, amIPlayer1=$amIPlayer1, isMyTurn=$isMyTurn")
-        addLog("Player1: ${player1Id.takeLast(8)}, Player2: ${player2Id.takeLast(8)}")
+        addLog("Player1: $player1Id, Player2: $player2Id")
         
         val msg = GameMessage(
             gameState = gameState,
@@ -237,7 +238,7 @@ class GameViewModel(
             val amIPlayer1 = (myDeviceId == player1Id)
             isMyTurn = amIPlayer1
             
-            addLog("RECEIVED ROLES: P1=${player1Id.takeLast(8)}, P2=${player2Id.takeLast(8)}")
+            addLog("RECEIVED ROLES: P1=$player1Id, P2=$player2Id")
             addLog("amIPlayer1=$amIPlayer1, isMyTurn=$isMyTurn")
             return
         }
@@ -337,18 +338,18 @@ fun GameScreen(
             ) {
                 Column(modifier = Modifier.padding(12.dp)) {
                     Text(
-                        "My ID: ${viewModel.myDeviceId.takeLast(8)}",
+                        "My ID: ${viewModel.myDeviceId}",
                         color = Color.White,
                         style = MaterialTheme.typography.titleMedium
                     )
                     if (viewModel.player1Id.isNotEmpty()) {
                         Text(
-                            "Player 1 (X): ${viewModel.player1Id.takeLast(8)}",
+                            "Player 1 (X): ${viewModel.player1Id}",
                             color = Color.White,
                             style = MaterialTheme.typography.bodySmall
                         )
                         Text(
-                            "Player 2 (O): ${viewModel.player2Id.takeLast(8)}",
+                            "Player 2 (O): ${viewModel.player2Id}",
                             color = Color.White,
                             style = MaterialTheme.typography.bodySmall
                         )
@@ -420,7 +421,7 @@ fun GameScreen(
                 ) {
                     Column(modifier = Modifier.padding(12.dp)) {
                         Text(
-                            "Current Turn: ${viewModel.getCurrentTurnPlayerId().takeLast(8)}",
+                            "Current Turn: ${viewModel.getCurrentTurnPlayerId()}",
                             color = Color.White,
                             style = MaterialTheme.typography.titleMedium
                         )
