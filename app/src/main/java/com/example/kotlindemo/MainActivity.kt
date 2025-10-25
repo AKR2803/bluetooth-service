@@ -232,6 +232,15 @@ class GameViewModel(
             player1Id = msg.player1Id
             player2Id = msg.player2Id
             isMyTurn = (myDeviceId == player1Id)
+            
+            // Send confirmation back so both devices sync
+            val confirmMsg = GameMessage(
+                gameState = gameState,
+                player1Id = player1Id,
+                player2Id = player2Id,
+                claimingPlayerId = player1Id
+            )
+            btService.sendMessage(confirmMsg.toJson())
             return
         }
 
