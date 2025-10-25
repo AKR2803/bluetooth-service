@@ -53,14 +53,12 @@ class MainActivity : ComponentActivity() {
         btService = BluetoothService(this, btAdapter)
         gameViewModel = GameViewModel(btAdapter, btService)
 
-        // Collect incoming messages
         lifecycleScope.launch {
             btService.incomingMessages.collectLatest { msg ->
                 msg?.let { gameViewModel.handleIncomingMessage(it) }
             }
         }
 
-        // Collect connection status to determine host/client role
         lifecycleScope.launch {
             btService.status.collectLatest { status ->
                 if (status is ConnectionStatus.Connected) {
@@ -73,8 +71,7 @@ class MainActivity : ComponentActivity() {
             MaterialTheme {
                 GameScreen(
                     viewModel = gameViewModel,
-                    onRequestPermissions = { requestBluetoothPermissions() },
-                    onShowToast = { msg -> Toast.makeText(this, msg, Toast.LENGTH_SHORT).show() }
+                    onRequestPermissions = { requestBluetoothPermissions() }
                 )
             }
         }
@@ -104,7 +101,7 @@ class GameViewModel(
     private val myDeviceId: String = try {
         adapter.address
     } catch (e: SecurityException) {
-        "UNKNOWN_${System.currentTimeMillis()}" // Fallback unique ID
+        "DEVICE_${System.currentTimeMillis()}"
     }
 
     var pairedDevices by mutableStateOf<List<BluetoothDevice>>(emptyList())
@@ -131,14 +128,12 @@ class GameViewModel(
     var gameMessage by mutableStateOf("")
         private set
 
-    private var isHost by mutableStateOf(false)
-    private var rolesAssigned by mutableStateOf(false)
+    private var isHost = false
+    private var amIPlayer1 = false
 
     init {
         kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.Dispatchers.Main).launch {
-            btService.status.collect { status ->
-                connectionStatus = status
-            }
+            btService.status.collect { connectionStatus = it }
         }
     }
 
@@ -167,28 +162,12 @@ class GameViewModel(
     }
 
     fun claimFirstTurn(iGoFirst: Boolean) {
-        // Host always assigns roles
-        if (isHost) {
-            if (iGoFirst) {
-                player1Id = myDeviceId
-                player2Id = selectedDevice?.address ?: "OPPONENT"
-            } else {
-                player1Id = selectedDevice?.address ?: "OPPONENT"
-                player2Id = myDeviceId
-            }
-        } else {
-            // Client waits for host to assign roles
-            if (iGoFirst) {
-                player1Id = myDeviceId
-                player2Id = "HOST"
-            } else {
-                player1Id = "HOST"
-                player2Id = myDeviceId
-            }
-        }
+        // Assign player IDs
+        player1Id = if (iGoFirst) myDeviceId else (selectedDevice?.address ?: "OPPONENT")
+        player2Id = if (iGoFirst) (selectedDevice?.address ?: "OPPONENT") else myDeviceId
         
-        rolesAssigned = true
-        isMyTurn = (player1Id == myDeviceId) // Player 1 always goes first
+        amIPlayer1 = (player1Id == myDeviceId)
+        isMyTurn = amIPlayer1 // Player 1 always starts
         
         val msg = GameMessage(
             gameState = gameState,
@@ -203,15 +182,16 @@ class GameViewModel(
         if (!isMyTurn || gameState.board[row][col] != " ") return
 
         val newBoard = gameState.board.map { it.clone() }.toTypedArray()
-        val mySymbol = if (myDeviceId == player1Id) "X" else "O"
+        val mySymbol = if (amIPlayer1) "X" else "O"
         newBoard[row][col] = mySymbol
 
+        val newTurn = gameState.turn + 1
         val winner = checkWinner(newBoard)
         val isDraw = winner == null && newBoard.all { row -> row.all { it != " " } }
 
         gameState = gameState.copy(
             board = newBoard,
-            turn = gameState.turn + 1,
+            turn = newTurn,
             winner = winner ?: "",
             isDraw = isDraw
         )
@@ -222,8 +202,7 @@ class GameViewModel(
             gameMessage = "Game is a draw!"
         }
 
-        // Switch turn immediately after move
-        isMyTurn = false
+        isMyTurn = false // Immediately disable my turn
 
         val msg = GameMessage(
             gameState = gameState,
@@ -236,48 +215,41 @@ class GameViewModel(
     fun handleIncomingMessage(json: String) {
         val msg = GameMessage.fromJson(json) ?: return
 
-        // Handle initial role assignment
-        if (!rolesAssigned && msg.claimingPlayerId.isNotEmpty()) {
+        // Initial role assignment from opponent
+        if (player1Id.isEmpty() && msg.player1Id.isNotEmpty()) {
             player1Id = msg.player1Id
             player2Id = msg.player2Id
-            rolesAssigned = true
+            amIPlayer1 = (myDeviceId == player1Id)
             
-            // Determine my turn based on role
-            isMyTurn = (myDeviceId == player1Id && msg.gameState.turn == 0) ||
-                       (myDeviceId == player2Id && msg.gameState.turn > 0 && msg.gameState.turn % 2 == 1)
-            
-            // Send confirmation back
-            val confirmMsg = GameMessage(
-                gameState = gameState,
-                player1Id = player1Id,
-                player2Id = player2Id,
-                claimingPlayerId = player1Id
-            )
-            btService.sendMessage(confirmMsg.toJson())
+            // Only Player 1 has turn at start
+            isMyTurn = amIPlayer1
             return
         }
 
         // Update game state from opponent's move
+        val oldTurn = gameState.turn
         gameState = msg.gameState
         
-        // Calculate whose turn it is based on turn counter
-        // Turn 0, 2, 4... = Player 1's turn
-        // Turn 1, 3, 5... = Player 2's turn
-        val isPlayer1Turn = (gameState.turn % 2 == 0)
-        val currentPlayerId = if (isPlayer1Turn) player1Id else player2Id
-        
-        isMyTurn = (currentPlayerId == myDeviceId) && 
-                   gameState.winner.isEmpty() && 
-                   !gameState.isDraw
+        // Only update turn if board actually changed (opponent made a move)
+        if (gameState.turn > oldTurn) {
+            // Determine whose turn based on turn number
+            // Turn 0, 2, 4... = Player 1
+            // Turn 1, 3, 5... = Player 2
+            val shouldBePlayer1Turn = (gameState.turn % 2 == 0)
+            isMyTurn = (shouldBePlayer1Turn && amIPlayer1) || (!shouldBePlayer1Turn && !amIPlayer1)
+            
+            // Don't allow turns if game is over
+            if (gameState.winner.isNotEmpty() || gameState.isDraw) {
+                isMyTurn = false
+            }
+        }
 
-        // Handle game end
         if (gameState.winner.isNotEmpty()) {
             gameMessage = "Winner: ${if (gameState.winner == "X") "Player 1 (X)" else "Player 2 (O)"}"
         } else if (gameState.isDraw) {
             gameMessage = "Game is a draw!"
         }
 
-        // Handle reset
         if (gameState.isReset) {
             resetGame()
         }
@@ -286,7 +258,7 @@ class GameViewModel(
     fun resetGame() {
         gameState = GameState()
         gameMessage = ""
-        isMyTurn = (myDeviceId == player1Id) // Player 1 starts again
+        isMyTurn = amIPlayer1 // Player 1 starts again
         
         val msg = GameMessage(
             gameState = gameState.copy(isReset = true),
@@ -297,17 +269,14 @@ class GameViewModel(
     }
 
     private fun checkWinner(board: Array<Array<String>>): String? {
-        // Check rows
         for (row in board) {
             if (row[0] != " " && row[0] == row[1] && row[1] == row[2]) return row[0]
         }
-        // Check columns
         for (col in 0..2) {
             if (board[0][col] != " " && board[0][col] == board[1][col] && board[1][col] == board[2][col]) {
                 return board[0][col]
             }
         }
-        // Check diagonals
         if (board[0][0] != " " && board[0][0] == board[1][1] && board[1][1] == board[2][2]) {
             return board[0][0]
         }
@@ -322,15 +291,12 @@ class GameViewModel(
 @Composable
 fun GameScreen(
     viewModel: GameViewModel,
-    onRequestPermissions: () -> Unit,
-    onShowToast: (String) -> Unit
+    onRequestPermissions: () -> Unit
 ) {
     var showTurnDialog by remember { mutableStateOf(false) }
 
     Scaffold(
-        topBar = {
-            TopAppBar(title = { Text("Tic-Tac-Toe Bluetooth") })
-        }
+        topBar = { TopAppBar(title = { Text("Tic-Tac-Toe Bluetooth") }) }
     ) { padding ->
         Column(
             modifier = Modifier
@@ -339,10 +305,8 @@ fun GameScreen(
                 .verticalScroll(rememberScrollState()),
             verticalArrangement = Arrangement.spacedBy(12.dp)
         ) {
-            // Connection status
             ConnectionStatusCard(viewModel.connectionStatus)
 
-            // Control buttons
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.spacedBy(8.dp)
@@ -364,7 +328,6 @@ fun GameScreen(
                 }
             }
 
-            // Device list
             if (viewModel.pairedDevices.isNotEmpty()) {
                 DeviceList(
                     devices = viewModel.pairedDevices,
@@ -381,7 +344,6 @@ fun GameScreen(
                 }
             }
 
-            // Start game button
             if (viewModel.connectionStatus is ConnectionStatus.Connected) {
                 Button(
                     onClick = { showTurnDialog = true },
@@ -391,7 +353,6 @@ fun GameScreen(
                 }
             }
 
-            // Game board
             if (viewModel.player1Id.isNotEmpty()) {
                 GameBoard(
                     gameState = viewModel.gameState,
