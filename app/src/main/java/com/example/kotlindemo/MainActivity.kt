@@ -11,7 +11,11 @@ import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.annotation.RequiresPermission
+import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.scrollable
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -19,217 +23,347 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.layout.onSizeChanged
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.toSize
 import androidx.core.content.ContextCompat
-import kotlinx.coroutines.launch
+import androidx.lifecycle.lifecycleScope
+import kotlinx.coroutines.flow.collectLatest
 
 class MainActivity : ComponentActivity() {
 
-    // cached adapter getter
-    private val btAdapter: BluetoothAdapter? by lazy {
+    private val adapter: BluetoothAdapter? by lazy {
         val bm = getSystemService(BLUETOOTH_SERVICE) as BluetoothManager
         bm.adapter
     }
 
-    private lateinit var service: BluetoothService
+    private lateinit var btService: BluetoothService
 
-    // Compose-observed state at activity level
+    // UI state
+    private var paired by mutableStateOf<List<BluetoothDevice>>(emptyList())
+    private var selectedAddr by mutableStateOf<String?>(null)
     private var logs by mutableStateOf("")
-    private var receivedText by mutableStateOf("")
-    private var pairedDevices by mutableStateOf<List<BluetoothDevice>>(emptyList())
+    private var incomingText by mutableStateOf("")
 
-    // permission launcher for multiple perms (API31+)
-    private val requestMultiplePerms =
-        registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { _ ->
-            // UI will refresh/reauthorize when user acts; we re-check when needed
-        }
+    // connection & handshake mapping
+    private var connectionEstablished by mutableStateOf(false)
+    private var handshakeCompleted by mutableStateOf(false)
+    private var pendingClaimId: String? = null // claim we sent and awaiting confirm
 
+    // game mapping and state
+    private var myId by mutableStateOf("")
+    private var oppId by mutableStateOf("")
+    private var player1Id by mutableStateOf("") // starter -> X
+    private var player2Id by mutableStateOf("") // other -> O
+    private var amPlayer1 by mutableStateOf<Boolean?>(null)
+    private var boardState by mutableStateOf(Array(3) { Array(3) { " " } })
+    private var turnCounter by mutableStateOf(0)
+    private var allowLocalMoves by mutableStateOf(false)
+
+    // permission launcher for S+ connect
+    private val requestPerms = registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) {}
+
+    @RequiresPermission("android.permission.LOCAL_MAC_ADDRESS")
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        val adapter = btAdapter
-        if (adapter == null) {
+        val btAdapter = adapter
+        if (btAdapter == null) {
             Toast.makeText(this, "Bluetooth not supported", Toast.LENGTH_LONG).show()
             finish(); return
         }
 
-        service = BluetoothService(adapter) { tag, msg ->
-            runOnUiThread {
-                if (tag == "RECV") {
-                    receivedText += msg + "\n"
-                } else {
-                    logs += msg + "\n"
-                }
+        myId = try { btAdapter.address } catch (_: SecurityException) { "unknown" }
+
+        btService = BluetoothService(this, btAdapter)
+
+        // collect logs & incoming messages
+        lifecycleScope.launchWhenStarted {
+            btService.logs.collectLatest { l -> logs += l + "\n" }
+        }
+        lifecycleScope.launchWhenStarted {
+            btService.incoming.collectLatest { msg ->
+                incomingText += msg + "\n"
+                handleIncoming(msg)
             }
         }
-
-        // Request old-location permission on API29 and below for discovery if needed
-        if (Build.VERSION.SDK_INT <= Build.VERSION_CODES.Q) {
-            if (ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED) {
-                requestMultiplePerms.launch(arrayOf(Manifest.permission.ACCESS_FINE_LOCATION))
-            }
+        lifecycleScope.launchWhenStarted {
+            btService.status.collectLatest { st -> connectionEstablished = (st == "CONNECTED") }
         }
 
-        setContent {
-            MaterialTheme {
-                BluetoothComposeScreen(
-                    logs = logs,
-                    received = receivedText,
-                    paired = pairedDevices,
-                    hasConnectPermission = { hasBtConnectPermission() },
-                    hasScanPermission = { hasBtScanPermissionOrLegacy() },
-                    requestPermissions = { requestPermissionsArray -> requestMultiplePerms.launch(requestPermissionsArray) },
-                    onStartServer = { service.startServer() },
-                    onStopServer = { service.stopServer() },
-                    onRefreshPaired = { refreshPaired() },
-                    onConnect = { device -> service.connectTo(device) },
-                    onSend = { msg -> service.send(msg) }
-                )
-            }
-        }
-
-        // initial paired load
-        refreshPaired()
+        setContent { MaterialTheme { AppContent() } }
     }
-
-    // Helper: check BLUETOOTH_CONNECT on S+, otherwise true (API < S doesn't require it)
-    private fun hasBtConnectPermission(): Boolean =
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-            ContextCompat.checkSelfPermission(this, Manifest.permission.BLUETOOTH_CONNECT) == PackageManager.PERMISSION_GRANTED
-        } else true
-
-    // For scanning: on S+ check BLUETOOTH_SCAN; on older check ACCESS_FINE_LOCATION
-    private fun hasBtScanPermissionOrLegacy(): Boolean =
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-            ContextCompat.checkSelfPermission(this, Manifest.permission.BLUETOOTH_SCAN) == PackageManager.PERMISSION_GRANTED
-        } else {
-            ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED
-        }
 
     private fun refreshPaired() {
-        val adapter = btAdapter ?: return
-        val list = try {
-            // On S+ we must check BLUETOOTH_CONNECT before reading bondedDevices or device.name
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S && !hasBtConnectPermission()) {
-                // permission missing: do not read sensitive fields
-                emptyList()
+        val a = adapter ?: return
+        try {
+            val set = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S &&
+                ContextCompat.checkSelfPermission(this, Manifest.permission.BLUETOOTH_CONNECT) != PackageManager.PERMISSION_GRANTED) {
+                // missing permission — show empty list
+                listOf<BluetoothDevice>()
             } else {
-                try {
-                    adapter.bondedDevices.toList().sortedBy { it.name ?: it.address }
-                } catch (se: SecurityException) {
-                    runOnUiThread { Toast.makeText(this, "Permission error reading paired devices", Toast.LENGTH_SHORT).show() }
-                    emptyList()
-                }
+                a.bondedDevices.toList()
             }
-        } catch (t: Throwable) {
-            emptyList()
+            paired = set.sortedBy { try { it.name ?: it.address } catch (_: Exception) { it.address } }
+        } catch (se: SecurityException) {
+            Toast.makeText(this, "Permission denied reading bonded devices", Toast.LENGTH_SHORT).show()
+            paired = emptyList()
         }
-        pairedDevices = list
-        runOnUiThread { Toast.makeText(this, "Paired: ${list.size}", Toast.LENGTH_SHORT).show() }
     }
 
-    override fun onDestroy() {
-        super.onDestroy()
-        service.stopAll()
+    private fun handleIncoming(raw: String) {
+        val gm = GameMessage.fromJsonString(raw) ?: return
+        // handshake: incoming claim (player1Choice set, player2Choice empty)
+        val mg = gm.miniGame
+        if (mg.player1Choice.isNotEmpty() && mg.player2Choice.isEmpty()) {
+            // recipient: set mapping and reply with confirmation including choices ordered
+            val claimed = mg.player1Choice
+            // set oppId if unknown
+            if (oppId.isBlank() && claimed != myId) oppId = claimed
+            // set mapping: player1 = claimed, player2 = other
+            player1Id = claimed
+            player2Id = if (claimed == myId) oppId else myId
+            amPlayer1 = (myId == player1Id)
+            handshakeCompleted = true
+            allowLocalMoves = (turnCounter % 2 == 0 && myId == player1Id)
+            // send confirmation
+            val confirm = GameMessage(
+                gameState = GameState(Array(3) { Array(3) { " " } }, "0", " ", false, true, false),
+                choices = listOf(Choice("player1", player1Id), Choice("player2", player2Id)),
+                miniGame = MiniGame(player1Id, player1Id)
+            )
+            btService.sendJson(confirm.toJsonString())
+            return
+        }
+
+        // confirmation: both set -> the sender receives this
+        if (mg.player1Choice.isNotEmpty() && mg.player2Choice.isNotEmpty()) {
+            // use choices ordering if available
+            val p1 = gm.choices.getOrNull(0)?.name ?: mg.player1Choice
+            val p2 = gm.choices.getOrNull(1)?.name ?: if (p1 == myId) oppId else myId
+            player1Id = p1
+            player2Id = p2
+            amPlayer1 = (myId == player1Id)
+            handshakeCompleted = true
+            pendingClaimId = null
+            // starter moves when turn == 0
+            allowLocalMoves = (turnCounter % 2 == 0 && myId == player1Id)
+            return
+        }
+
+        // normal game update: apply board, turn and mapping if present
+        val p1id = gm.choices.getOrNull(0)?.name ?: ""
+        val p2id = gm.choices.getOrNull(1)?.name ?: ""
+        if (p1id.isNotEmpty() && p2id.isNotEmpty()) {
+            player1Id = p1id; player2Id = p2id; amPlayer1 = (myId == player1Id)
+        }
+        boardState = copyBoard(gm.gameState.board)
+        turnCounter = gm.gameState.turn.toIntOrNull() ?: turnCounter
+        // enable local moves only if current player (by parity) equals myId
+        val currentPlayer = if (turnCounter % 2 == 0) player1Id else player2Id
+        allowLocalMoves = (currentPlayer == myId)
     }
-}
 
-@OptIn(ExperimentalMaterial3Api::class)
-@Composable
-fun BluetoothComposeScreen(
-    logs: String,
-    received: String,
-    paired: List<BluetoothDevice>,
-    hasConnectPermission: () -> Boolean,
-    hasScanPermission: () -> Boolean,
-    requestPermissions: (Array<String>) -> Unit,
-    onStartServer: () -> Unit,
-    onStopServer: () -> Unit,
-    onRefreshPaired: () -> Unit,
-    onConnect: (BluetoothDevice) -> Unit,
-    onSend: (String) -> Unit
-) {
-    var message by remember { mutableStateOf("Hello from Compose!") }
-    var selectedAddress by remember { mutableStateOf<String?>(null) }
-    val coroutineScope = rememberCoroutineScope()
-
-    // helper: build an Array<String> of required perms depending on API level (lint-friendly)
-    val neededPermsForRequest = remember {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-            arrayOf(Manifest.permission.BLUETOOTH_CONNECT, Manifest.permission.BLUETOOTH_SCAN)
-        } else arrayOf(Manifest.permission.ACCESS_FINE_LOCATION)
+    private fun copyBoard(src: Array<Array<String>>): Array<Array<String>> {
+        val a = Array(3) { Array(3) { " " } }
+        for (r in 0..2) for (c in 0..2) a[r][c] = src[r][c]
+        return a
     }
 
-    Scaffold(topBar = { TopAppBar(title = { Text("BT Compose Minimal (safe)") }) }) { padding ->
-        Column(Modifier.padding(padding).padding(12.dp).fillMaxSize(), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                Button(onClick = { onStartServer() }) { Text("Start Server") }
-                Button(onClick = { onStopServer() }) { Text("Stop Server") }
-                Button(onClick = {
-                    // if missing perms, trigger request
-                    if (!hasScanPermission()) {
-                        requestPermissions(neededPermsForRequest)
-                    } else {
-                        onRefreshPaired()
-                    }
-                }) { Text("Refresh Paired") }
-            }
+    private fun computeWinner(board: Array<Array<String>>): String? {
+        for (r in 0..2) if (board[r][0] != " " && board[r][0] == board[r][1] && board[r][1] == board[r][2]) return board[r][0]
+        for (c in 0..2) if (board[0][c] != " " && board[0][c] == board[1][c] && board[1][c] == board[2][c]) return board[0][c]
+        if (board[0][0] != " " && board[0][0] == board[1][1] && board[1][1] == board[2][2]) return board[0][0]
+        if (board[0][2] != " " && board[0][2] == board[1][1] && board[1][1] == board[2][0]) return board[0][2]
+        val full = board.all { row -> row.all { it != " " } }
+        if (full) return null
+        return null
+    }
 
-            Text("Paired devices (tap to select):")
-            LazyColumn(modifier = Modifier.height(140.dp)) {
-                items(paired) { dev ->
-                    // access name/address only if permission allows it (or API < S)
-                    val canShow = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) hasConnectPermission() else true
-                    val name = try {
-                        if (canShow) dev.name ?: "Unknown" else "Name hidden (grant permission)"
-                    } catch (se: SecurityException) {
-                        "Name hidden (permission)"
-                    } catch (_: Exception) { "Unknown" }
-                    val addr = try {
-                        if (canShow) dev.address else "Address hidden (grant permission)"
-                    } catch (se: SecurityException) {
-                        "Address hidden (permission)"
-                    } catch (_: Exception) { "no-addr" }
+    @OptIn(ExperimentalMaterial3Api::class)
+    @Composable
+    fun AppContent() {
+        var showWhoDialog by remember { mutableStateOf(false) }
+        val verticalScrollState = rememberScrollState()
+        val buttonRowScroll = rememberScrollState() // Still useful for smaller screens or future buttons
 
-                    val selected = selectedAddress == addr
-                    Card(modifier = Modifier
+        Scaffold(topBar = { TopAppBar(title = { Text("TicTacToe - Responsive UI") }) }) { padding ->
+            Column(
+                Modifier
+                    .padding(padding)
+                    .padding(12.dp)
+                    .verticalScroll(verticalScrollState), // <-- page scrollable
+                verticalArrangement = Arrangement.spacedBy(10.dp)
+            ) {
+                Text("MyId: $myId  OppId: ${oppId.ifBlank { "none" }}")
+                Text("Connected: $connectionEstablished  Handshake: $handshakeCompleted  Your turn? ${if (allowLocalMoves) "YES" else "NO"}")
+
+                // Button row: horizontally scrollable if too many buttons
+                Row(
+                    modifier = Modifier
                         .fillMaxWidth()
-                        .padding(4.dp)
-                        .clickable { selectedAddress = addr }) {
-                        Row(Modifier.padding(12.dp)) {
-                            Column(Modifier.weight(1f)) {
-                                Text("$name")
-                                Text(addr, style = MaterialTheme.typography.labelSmall)
+                        .horizontalScroll(buttonRowScroll),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    // Critical buttons first:
+                    Button(onClick = { btService.startServer(); logs += "server started\n" }) { Text("Start Server") }
+                    Button(onClick = {
+                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                            val ok = ContextCompat.checkSelfPermission(this@MainActivity, Manifest.permission.BLUETOOTH_CONNECT) == PackageManager.PERMISSION_GRANTED
+                            if (!ok) {
+                                requestPerms.launch(arrayOf(Manifest.permission.BLUETOOTH_CONNECT))
+                                return@Button
                             }
-                            if (selected) Text("SELECTED", Modifier.padding(start = 8.dp))
+                        }
+                        refreshPaired()
+                    }) { Text("Show Paired") }
+                    Button(onClick = {
+                        val dev = paired.firstOrNull { it.address == selectedAddr }
+                        if (dev != null) {
+                            oppId = try { dev.address } catch (_: Exception) { oppId }
+                            btService.connectTo(dev)
+                        } else logs += "No device selected\n"
+                    }) { Text("Connect") }
+
+                    // **FIXED: Moved "Start Game" here to be immediately visible after Connect.**
+                    Button(onClick = {
+                        if (!connectionEstablished) Toast.makeText(this@MainActivity, "Not connected", Toast.LENGTH_SHORT).show()
+                        else showWhoDialog = true
+                    }) { Text("Start Game") }
+
+                    // Less critical buttons last (can scroll):
+                    Button(onClick = {
+                        // Reset & Send as debug
+                        boardState = Array(3) { Array(3) { " " } }
+                        turnCounter = 0
+                        allowLocalMoves = false
+                        val gm = GameMessage(GameState(boardState, "0", " ", false, true, true), listOf(Choice("player1", myId), Choice("player2", oppId)), MiniGame("", ""))
+                        btService.sendJson(gm.toJsonString())
+                        logs += "Reset & sent\n"
+                    }) { Text("Reset & Send") }
+                }
+
+                HorizontalDivider()
+
+                // ... rest of AppContent remains the same
+                Text("Paired devices (tap to select) — scroll if many:")
+                LazyColumn(modifier = Modifier.fillMaxWidth().heightIn(max = 200.dp)) {
+                    items(paired) { d ->
+                        val name = try { d.name ?: "Unknown" } catch (_: Exception) { "Unknown" }
+                        Row(
+                            Modifier
+                                .fillMaxWidth()
+                                .clickable { selectedAddr = d.address }
+                                .padding(8.dp), verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Column(Modifier.weight(1f)) {
+                                Text(name)
+                                Text(d.address, style = MaterialTheme.typography.labelSmall)
+                            }
+                            if (selectedAddr == d.address) Text("SELECTED", color = MaterialTheme.colorScheme.primary)
                         }
                     }
                 }
+
+                HorizontalDivider()
+
+                // Board area
+                BoxWithConstraints(modifier = Modifier.fillMaxWidth(), contentAlignment = Alignment.Center) {
+                    val totalPadding = 16.dp
+                    val spacing = 8.dp
+                    val boardAvailWidth: Dp = this.maxWidth - totalPadding
+                    val cellSize: Dp = (boardAvailWidth - spacing * 2f) / 3f
+
+                    Column(verticalArrangement = Arrangement.spacedBy(spacing)) {
+                        for (r in 0..2) {
+                            Row(horizontalArrangement = Arrangement.spacedBy(spacing)) {
+                                for (c in 0..2) {
+                                    val cell = boardState[r][c]
+                                    Card(
+                                        modifier = Modifier
+                                            .size(cellSize)
+                                            .clickable(enabled = allowLocalMoves && cell == " ") {
+                                                if (!handshakeCompleted) { logs += "Move blocked: handshake not complete\n"; return@clickable }
+                                                val mySymbol = if (myId == player1Id) "X" else "O"
+                                                boardState = copyBoard(boardState)
+                                                boardState[r][c] = mySymbol
+                                                turnCounter += 1
+                                                val w = computeWinner(boardState)
+                                                if (w != null) logs += "Local winner: $w\n"
+                                                allowLocalMoves = false
+                                                val gm = GameMessage(
+                                                    gameState = GameState(boardState, turnCounter.toString(), " ", false, true, false),
+                                                    choices = listOf(Choice("player1", player1Id), Choice("player2", player2Id)),
+                                                    miniGame = MiniGame(player1Id, player1Id)
+                                                )
+                                                btService.sendJson(gm.toJsonString())
+                                            },
+                                        elevation = CardDefaults.cardElevation(defaultElevation = 4.dp)
+                                    ) {
+                                        Box(contentAlignment = Alignment.Center, modifier = Modifier.fillMaxSize()) {
+                                            Text(cell, style = MaterialTheme.typography.titleLarge)
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+
+                HorizontalDivider()
+
+                Text("Logs:")
+                Surface(Modifier.fillMaxWidth().heightIn(min = 80.dp, max = 200.dp).padding(4.dp)) { Text(logs) }
+                Spacer(modifier = Modifier.height(8.dp))
+                Text("Incoming raw:")
+                Surface(Modifier.fillMaxWidth().heightIn(min = 80.dp, max = 200.dp).padding(4.dp)) { Text(incomingText) }
+
+                Spacer(modifier = Modifier.height(24.dp)) // small bottom padding when scrolled
             }
-
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                Button(onClick = {
-                    val dev = paired.firstOrNull { it.address == selectedAddress }
-                    if (dev != null) onConnect(dev)
-                }) { Text("Connect") }
-
-                Button(onClick = {
-                    val dev = paired.firstOrNull { it.address == selectedAddress }
-                    if (dev != null) coroutineScope.launch { onConnect(dev) }
-                }) { Text("Connect (async)") }
-            }
-
-            OutlinedTextField(value = message, onValueChange = { message = it }, label = { Text("Message") }, modifier = Modifier.fillMaxWidth())
-            Button(onClick = { onSend(message) }, modifier = Modifier.fillMaxWidth()) { Text("Send") }
-
-            Text("Received:")
-            Surface(Modifier.fillMaxWidth().height(120.dp).padding(4.dp)) { Text(received) }
-
-            Text("Logs:")
-            Surface(Modifier.fillMaxWidth().height(140.dp).padding(4.dp).verticalScroll(
-                rememberScrollState()
-            )) { Text(logs) }
         }
+
+        if (showWhoDialog) {
+            AlertDialog(onDismissRequest = { showWhoDialog = false },
+                title = { Text("Who Goes First?") },
+                text = { Text("Tap ME if you want to go first (X), or OPPONENT to let the other device start.") },
+                confirmButton = {
+                    TextButton(onClick = {
+                        pendingClaimId = myId
+                        val gm = GameMessage(
+                            GameState(Array(3) { Array(3) { " " } }, "0", " ", false, true, false),
+                            listOf(Choice("player1", myId), Choice("player2", oppId)),
+                            MiniGame(myId, "")
+                        )
+                        btService.sendJson(gm.toJsonString())
+                        showWhoDialog = false
+                        logs += "Sent claim: I go first (awaiting confirm)\n"
+                    }) { Text("ME (I go first)") }
+                },
+                dismissButton = {
+                    TextButton(onClick = {
+                        pendingClaimId = oppId
+                        val gm = GameMessage(
+                            GameState(Array(3) { Array(3) { " " } }, "0", " ", false, true, false),
+                            listOf(Choice("player1", myId), Choice("player2", oppId)),
+                            MiniGame(oppId, "")
+                        )
+                        btService.sendJson(gm.toJsonString())
+                        showWhoDialog = false
+                        logs += "Sent claim: Opponent goes first (awaiting confirm)\n"
+                    }) { Text("OPPONENT (they go first)") }
+                })
+        }
+    }
+
+
+
+    override fun onDestroy() {
+        super.onDestroy()
+        btService.stopAll()
     }
 }

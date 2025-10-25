@@ -1,210 +1,144 @@
 package com.example.kotlindemo
 
-import android.bluetooth.BluetoothAdapter
-import android.bluetooth.BluetoothServerSocket
-import android.bluetooth.BluetoothSocket
-import android.util.Log
-import java.io.IOException
-import java.io.InputStream
-import java.io.OutputStream
-import java.util.UUID
-import java.util.concurrent.Executors
+import android.Manifest
+import android.bluetooth.*
+import android.content.Context
+import android.content.pm.PackageManager
+import android.os.Build
+import kotlinx.coroutines.*
+import kotlinx.coroutines.flow.MutableSharedFlow
+import kotlinx.coroutines.flow.MutableStateFlow
+import java.io.BufferedReader
+import java.io.InputStreamReader
+import java.io.OutputStreamWriter
+import java.util.*
 
-/**
- * Minimal networking layer. Defensive: catches SecurityException around all Bluetooth calls
- * that may require runtime permissions on newer Android releases.
- */
+private val SPP_UUID: UUID = UUID.fromString("00001101-0000-1000-8000-00805F9B34FB")
+
+fun BluetoothSocket?.closeSafe() {
+    try { this?.close() } catch (_: Exception) {}
+}
+
 class BluetoothService(
-    private val adapter: BluetoothAdapter,
-    private val uiCallback: (tag: String, msg: String) -> Unit
+    private val context: Context,
+    private val adapter: BluetoothAdapter
 ) {
-    companion object {
-        private const val TAG = "BluetoothService"
-        val SPP_UUID: UUID = UUID.fromString("00001101-0000-1000-8000-00805F9B34FB")
-        private const val SERVICE_NAME = "BTComposeSPP"
-    }
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
-    @Volatile private var serverSocket: BluetoothServerSocket? = null
-    @Volatile private var activeSocket: BluetoothSocket? = null
-    private val exec = Executors.newCachedThreadPool()
+    // expose simple flows for UI
+    val status = MutableStateFlow("IDLE") // IDLE, LISTENING, CONNECTING, CONNECTED, DISCONNECTED
+    val incoming = MutableSharedFlow<String>(extraBufferCapacity = 64)
+    val logs = MutableSharedFlow<String>(extraBufferCapacity = 128)
 
-    private fun log(msg: String) {
-        Log.d(TAG, msg)
-        try { uiCallback("LOG", msg) } catch (_: Exception) {}
-    }
+    private var serverSocket: BluetoothServerSocket? = null
+    private var socket: BluetoothSocket? = null
 
     fun startServer() {
-        stopServer()
-        exec.execute {
+        scope.launch {
             try {
-                log("startServer: creating server socket")
-                serverSocket = try {
-                    adapter.listenUsingRfcommWithServiceRecord(SERVICE_NAME, SPP_UUID)
-                } catch (se: SecurityException) {
-                    log("startServer: SecurityException creating server socket: ${se.message}")
-                    null
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S &&
+                    context.checkSelfPermission(Manifest.permission.BLUETOOTH_CONNECT) != PackageManager.PERMISSION_GRANTED) {
+                    logs.tryEmit("Missing BLUETOOTH_CONNECT to startServer()")
+                    return@launch
                 }
-                if (serverSocket == null) return@execute
-
-                log("startServer: waiting for accept()")
-                val sock = try {
-                    serverSocket?.accept()
-                } catch (io: IOException) {
-                    log("startServer: accept() failed: ${io.message}")
-                    null
-                } catch (se: SecurityException) {
-                    log("startServer: accept() SecurityException: ${se.message}")
-                    null
+                logs.tryEmit("startServer: listening")
+                status.value = "LISTENING"
+                serverSocket = adapter.listenUsingRfcommWithServiceRecord("KotlinDemo", SPP_UUID)
+                val sock = serverSocket?.accept() // blocks
+                if (sock != null) {
+                    onConnected(sock)
+                } else {
+                    logs.tryEmit("startServer: accept returned null")
                 }
-                if (sock == null) {
-                    log("startServer: no socket accepted")
-                    return@execute
-                }
-                val remote = try { sock.remoteDevice.address } catch (_: Exception) { "unknown" }
-                log("startServer: accepted from $remote")
-                cleanupActiveSocket()
-                activeSocket = sock
-                startIo(sock)
-            } catch (t: Throwable) {
-                log("startServer: unexpected: ${t.message}")
+            } catch (se: SecurityException) {
+                logs.tryEmit("startServer SecurityException: ${se.message}")
+            } catch (io: Exception) {
+                logs.tryEmit("startServer Exception: ${io.message}")
+            } finally {
+                try { serverSocket?.close() } catch (_: Exception) {}
+                serverSocket = null
             }
         }
     }
 
-    fun stopServer() {
-        log("stopServer: closing server socket")
-        try { serverSocket?.close() } catch (e: Exception) { log("stopServer close err: ${e.message}") }
-        serverSocket = null
-    }
-
-    fun connectTo(device: android.bluetooth.BluetoothDevice) {
-        exec.execute {
-            // obtain safe device id for logs without calling protected getters (defensive)
-            val devAddr = try { device.address } catch (_: Exception) { "unknown" }
-            val devNameSafe = try { device.name } catch (se: SecurityException) { null } catch (_: Exception) { null }
-            log("connectTo: connecting to $devAddr / ${devNameSafe ?: "name-unavailable"}")
-
-            cleanupActiveSocket()
-            try { adapter.cancelDiscovery() } catch (se: SecurityException) {
-                log("connectTo: cancelDiscovery SecurityException (ignored): ${se.message}")
-            } catch (_: Exception) {}
-
-            val sock = try {
-                device.createRfcommSocketToServiceRecord(SPP_UUID)
-            } catch (se: SecurityException) {
-                log("connectTo: create socket SecurityException: ${se.message}")
-                null
-            } catch (e: Exception) {
-                log("connectTo: create socket failed: ${e.message}")
-                null
-            } ?: return@execute
-
+    fun connectTo(device: BluetoothDevice) {
+        scope.launch {
             try {
-                log("connectTo: socket.connect() ... (may block)")
-                sock.connect()
-                log("connectTo: connected")
-                activeSocket = sock
-                startIo(sock)
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S &&
+                    context.checkSelfPermission(Manifest.permission.BLUETOOTH_CONNECT) != PackageManager.PERMISSION_GRANTED) {
+                    logs.tryEmit("Missing BLUETOOTH_CONNECT to connectTo()")
+                    return@launch
+                }
+                status.value = "CONNECTING"
+                logs.tryEmit("connectTo: connecting to ${device.address}")
+                try { adapter.cancelDiscovery() } catch (_: Exception) {}
+                val sock = device.createRfcommSocketToServiceRecord(SPP_UUID)
+                sock.connect() // may block
+                onConnected(sock)
             } catch (se: SecurityException) {
-                log("connectTo: SecurityException during connect: ${se.message}")
-                try { sock.close() } catch (_: Exception) {}
-            } catch (io: IOException) {
-                log("connectTo: IOException during connect: ${io.message}")
-                try { sock.close() } catch (_: Exception) {}
-            } catch (t: Throwable) {
-                log("connectTo: unexpected during connect: ${t.message}")
-                try { sock.close() } catch (_: Exception) {}
+                logs.tryEmit("connectTo SecurityException: ${se.message}")
+            } catch (io: Exception) {
+                logs.tryEmit("connectTo failed: ${io.message}")
+                status.value = "DISCONNECTED"
             }
         }
     }
 
-    private fun startIo(sock: BluetoothSocket) {
-        exec.execute {
-            var input: InputStream? = null
-            var output: OutputStream? = null
-            try {
-                input = try { sock.inputStream } catch (se: SecurityException) {
-                    log("startIo: inputStream SecurityException: ${se.message}"); null
-                } catch (e: Exception) { log("startIo: inputStream error: ${e.message}"); null }
-                output = try { sock.outputStream } catch (se: SecurityException) {
-                    log("startIo: outputStream SecurityException: ${se.message}"); null
-                } catch (e: Exception) { log("startIo: outputStream error: ${e.message}"); null }
+    private fun onConnected(s: BluetoothSocket) {
+        socket?.closeSafe()
+        socket = s
+        logs.tryEmit("onConnected: ${s.remoteDevice.address}")
+        status.value = "CONNECTED"
+        startIoLoop(s)
+    }
 
-                if (input == null || output == null) {
-                    try { sock.close() } catch (_: Exception) {}
-                    return@execute
-                }
-            } catch (t: Throwable) {
-                log("startIo: unexpected stream error: ${t.message}")
-                try { sock.close() } catch (_: Exception) {}
-                return@execute
-            }
-
-            val buf = ByteArray(1024)
+    private fun startIoLoop(sock: BluetoothSocket) {
+        scope.launch {
+            val reader = BufferedReader(InputStreamReader(sock.inputStream, Charsets.UTF_8))
+            val writer = OutputStreamWriter(sock.outputStream, Charsets.UTF_8)
             try {
                 while (true) {
-                    val r = try { input.read(buf) } catch (io: IOException) {
-                        log("startIo: read exception: ${io.message}")
-                        -1
-                    } catch (se: SecurityException) {
-                        log("startIo: read SecurityException: ${se.message}")
-                        -1
-                    }
-                    log("startIo: read returned $r")
-                    if (r <= 0) break
-                    val s = String(buf, 0, r, Charsets.UTF_8)
-                    log("startIo: received -> $s")
-                    try { uiCallback("RECV", s) } catch (_: Exception) {}
+                    val line = reader.readLine() ?: break
+                    incoming.tryEmit(line)
                 }
+            } catch (io: Exception) {
+                logs.tryEmit("IO loop exception: ${io.message}")
             } finally {
-                log("startIo: closing socket")
+                logs.tryEmit("Connection closed")
+                status.value = "DISCONNECTED"
                 try { sock.close() } catch (_: Exception) {}
-                if (activeSocket === sock) activeSocket = null
             }
         }
     }
 
-    fun send(message: String) {
-        exec.execute {
-            val sock = activeSocket
-            if (sock == null) {
-                log("send: no active socket")
-                return@execute
+    fun sendJson(json: String) {
+        scope.launch {
+            val s = socket
+            if (s == null) {
+                logs.tryEmit("sendJson failed: no socket")
+                return@launch
             }
             try {
-                val out = try { sock.outputStream } catch (se: SecurityException) {
-                    log("send: outputStream SecurityException: ${se.message}"); null
-                } catch (e: Exception) {
-                    log("send: outputStream error: ${e.message}"); null
-                }
-                if (out == null) {
-                    log("send: no output stream available")
-                    return@execute
-                }
-                val data = message.toByteArray(Charsets.UTF_8)
-                out.write(data)
+                val out = s.outputStream
+                out.write((json + "\n").toByteArray(Charsets.UTF_8))
                 out.flush()
-                log("send: wrote ${data.size} bytes")
-            } catch (se: SecurityException) {
-                log("send: SecurityException: ${se.message}")
-            } catch (io: IOException) {
-                log("send: IOException: ${io.message}")
-            } catch (t: Throwable) {
-                log("send: unexpected: ${t.message}")
+                logs.tryEmit("sendJson: wrote ${json.length} bytes")
+            } catch (io: Exception) {
+                logs.tryEmit("sendJson exception: ${io.message}")
+                try { s.close() } catch (_: Exception) {}
+                status.value = "DISCONNECTED"
             }
         }
     }
 
     fun stopAll() {
-        log("stopAll: closing everything")
-        try { activeSocket?.close() } catch (_: Exception) {}
-        activeSocket = null
-        stopServer()
-        try { exec.shutdownNow() } catch (_: Exception) {}
-    }
-
-    private fun cleanupActiveSocket() {
-        try { activeSocket?.close() } catch (_: Exception) {}
-        activeSocket = null
+        scope.launch {
+            try { socket?.closeSafe() } catch (_: Exception) {}
+            try { serverSocket?.close() } catch (_: Exception) {}
+            socket = null
+            serverSocket = null
+            status.value = "DISCONNECTED"
+            logs.tryEmit("stopAll: stopped")
+        }
     }
 }
