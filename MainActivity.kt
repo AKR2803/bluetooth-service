@@ -1,0 +1,524 @@
+package com.example.kotlindemo
+
+import android.Manifest
+import android.bluetooth.BluetoothAdapter
+import android.bluetooth.BluetoothDevice
+import android.bluetooth.BluetoothManager
+import android.content.pm.PackageManager
+import android.os.Build
+import android.os.Bundle
+import android.widget.Toast
+import androidx.activity.ComponentActivity
+import androidx.activity.compose.setContent
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.material3.*
+import androidx.compose.runtime.*
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.unit.dp
+import androidx.lifecycle.lifecycleScope
+import kotlinx.coroutines.flow.collectLatest
+import kotlinx.coroutines.launch
+
+class MainActivity : ComponentActivity() {
+    private lateinit var btService: BluetoothService
+    private lateinit var gameViewModel: GameViewModel
+    
+    private val adapter: BluetoothAdapter? by lazy {
+        (getSystemService(BLUETOOTH_SERVICE) as BluetoothManager).adapter
+    }
+
+    private val permissionLauncher = registerForActivityResult(
+        ActivityResultContracts.RequestMultiplePermissions()
+    ) { /* Handle result */ }
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+
+        val btAdapter = adapter
+        if (btAdapter == null) {
+            Toast.makeText(this, "Bluetooth not supported", Toast.LENGTH_LONG).show()
+            finish()
+            return
+        }
+
+        btService = BluetoothService(this, btAdapter)
+        gameViewModel = GameViewModel(btAdapter, btService)
+
+        // Collect incoming messages
+        lifecycleScope.launch {
+            btService.incomingMessages.collectLatest { msg ->
+                msg?.let { gameViewModel.handleIncomingMessage(it) }
+            }
+        }
+
+        setContent {
+            MaterialTheme {
+                GameScreen(
+                    viewModel = gameViewModel,
+                    onRequestPermissions = { requestBluetoothPermissions() },
+                    onShowToast = { msg -> Toast.makeText(this, msg, Toast.LENGTH_SHORT).show() }
+                )
+            }
+        }
+    }
+
+    private fun requestBluetoothPermissions() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            permissionLauncher.launch(
+                arrayOf(
+                    Manifest.permission.BLUETOOTH_CONNECT,
+                    Manifest.permission.BLUETOOTH_SCAN
+                )
+            )
+        }
+    }
+
+    override fun onDestroy() {
+        super.onDestroy()
+        btService.cleanup()
+    }
+}
+
+class GameViewModel(
+    private val adapter: BluetoothAdapter,
+    private val btService: BluetoothService
+) {
+    private val myDeviceId: String = try {
+        adapter.address
+    } catch (e: SecurityException) {
+        "UNKNOWN"
+    }
+
+    var pairedDevices by mutableStateOf<List<BluetoothDevice>>(emptyList())
+        private set
+    
+    var selectedDevice by mutableStateOf<BluetoothDevice?>(null)
+        private set
+    
+    var connectionStatus by mutableStateOf<ConnectionStatus>(ConnectionStatus.Idle)
+        private set
+    
+    var gameState by mutableStateOf(GameState())
+        private set
+    
+    var player1Id by mutableStateOf("")
+        private set
+    
+    var player2Id by mutableStateOf("")
+        private set
+    
+    var isMyTurn by mutableStateOf(false)
+        private set
+    
+    var gameMessage by mutableStateOf("")
+        private set
+
+    init {
+        // Observe connection status
+        kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.Dispatchers.Main).launch {
+            btService.status.collect { status ->
+                connectionStatus = status
+            }
+        }
+    }
+
+    fun loadPairedDevices() {
+        try {
+            pairedDevices = adapter.bondedDevices.toList()
+        } catch (e: SecurityException) {
+            pairedDevices = emptyList()
+        }
+    }
+
+    fun selectDevice(device: BluetoothDevice) {
+        selectedDevice = device
+    }
+
+    fun startServer() {
+        btService.startServer()
+    }
+
+    fun connectToSelected() {
+        selectedDevice?.let { btService.connectToDevice(it) }
+    }
+
+    fun claimFirstTurn(iGoFirst: Boolean) {
+        if (iGoFirst) {
+            player1Id = myDeviceId
+            player2Id = selectedDevice?.address ?: ""
+        } else {
+            player1Id = selectedDevice?.address ?: ""
+            player2Id = myDeviceId
+        }
+        
+        val msg = GameMessage(
+            gameState = gameState,
+            player1Id = player1Id,
+            player2Id = player2Id,
+            claimingPlayerId = player1Id
+        )
+        btService.sendMessage(msg.toJson())
+        
+        // If I go first, enable my turn
+        isMyTurn = iGoFirst
+    }
+
+    fun makeMove(row: Int, col: Int) {
+        if (!isMyTurn || gameState.board[row][col] != " ") return
+
+        val newBoard = gameState.board.map { it.clone() }.toTypedArray()
+        val mySymbol = if (myDeviceId == player1Id) "X" else "O"
+        newBoard[row][col] = mySymbol
+
+        val winner = checkWinner(newBoard)
+        val isDraw = winner == null && newBoard.all { row -> row.all { it != " " } }
+
+        gameState = gameState.copy(
+            board = newBoard,
+            turn = gameState.turn + 1,
+            winner = winner ?: "",
+            isDraw = isDraw
+        )
+
+        if (winner != null) {
+            gameMessage = "Winner: ${if (winner == "X") "Player 1" else "Player 2"}"
+        } else if (isDraw) {
+            gameMessage = "Game is a draw!"
+        }
+
+        val msg = GameMessage(
+            gameState = gameState,
+            player1Id = player1Id,
+            player2Id = player2Id
+        )
+        btService.sendMessage(msg.toJson())
+        
+        isMyTurn = false
+    }
+
+    fun handleIncomingMessage(json: String) {
+        val msg = GameMessage.fromJson(json) ?: return
+
+        // Handle turn claim
+        if (msg.claimingPlayerId.isNotEmpty() && player1Id.isEmpty()) {
+            player1Id = msg.player1Id
+            player2Id = msg.player2Id
+            
+            // Confirm the claim
+            val confirmMsg = GameMessage(
+                gameState = gameState,
+                player1Id = player1Id,
+                player2Id = player2Id,
+                claimingPlayerId = player1Id
+            )
+            btService.sendMessage(confirmMsg.toJson())
+            
+            // Set turn based on who I am
+            isMyTurn = (myDeviceId == player1Id && msg.gameState.turn == 0)
+            return
+        }
+
+        // Update game state
+        gameState = msg.gameState
+        
+        // Determine if it's my turn
+        val currentPlayer = if (gameState.turn % 2 == 0) player1Id else player2Id
+        isMyTurn = (currentPlayer == myDeviceId) && gameState.winner.isEmpty() && !gameState.isDraw
+
+        // Handle game end
+        if (gameState.winner.isNotEmpty()) {
+            gameMessage = "Winner: ${if (gameState.winner == "X") "Player 1" else "Player 2"}"
+        } else if (gameState.isDraw) {
+            gameMessage = "Game is a draw!"
+        }
+
+        // Handle reset
+        if (gameState.isReset) {
+            resetGame()
+        }
+    }
+
+    fun resetGame() {
+        gameState = GameState()
+        gameMessage = ""
+        isMyTurn = (myDeviceId == player1Id)
+        
+        val msg = GameMessage(
+            gameState = gameState.copy(isReset = true),
+            player1Id = player1Id,
+            player2Id = player2Id
+        )
+        btService.sendMessage(msg.toJson())
+    }
+
+    private fun checkWinner(board: Array<Array<String>>): String? {
+        // Check rows
+        for (row in board) {
+            if (row[0] != " " && row[0] == row[1] && row[1] == row[2]) return row[0]
+        }
+        // Check columns
+        for (col in 0..2) {
+            if (board[0][col] != " " && board[0][col] == board[1][col] && board[1][col] == board[2][col]) {
+                return board[0][col]
+            }
+        }
+        // Check diagonals
+        if (board[0][0] != " " && board[0][0] == board[1][1] && board[1][1] == board[2][2]) {
+            return board[0][0]
+        }
+        if (board[0][2] != " " && board[0][2] == board[1][1] && board[1][1] == board[2][0]) {
+            return board[0][2]
+        }
+        return null
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun GameScreen(
+    viewModel: GameViewModel,
+    onRequestPermissions: () -> Unit,
+    onShowToast: (String) -> Unit
+) {
+    var showTurnDialog by remember { mutableStateOf(false) }
+
+    Scaffold(
+        topBar = {
+            TopAppBar(title = { Text("Tic-Tac-Toe Bluetooth") })
+        }
+    ) { padding ->
+        Column(
+            modifier = Modifier
+                .padding(padding)
+                .padding(16.dp)
+                .verticalScroll(rememberScrollState()),
+            verticalArrangement = Arrangement.spacedBy(12.dp)
+        ) {
+            // Connection status
+            ConnectionStatusCard(viewModel.connectionStatus)
+
+            // Control buttons
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                Button(
+                    onClick = { viewModel.startServer() },
+                    modifier = Modifier.weight(1f)
+                ) {
+                    Text("Listen")
+                }
+                Button(
+                    onClick = {
+                        onRequestPermissions()
+                        viewModel.loadPairedDevices()
+                    },
+                    modifier = Modifier.weight(1f)
+                ) {
+                    Text("Scan")
+                }
+            }
+
+            // Device list
+            if (viewModel.pairedDevices.isNotEmpty()) {
+                DeviceList(
+                    devices = viewModel.pairedDevices,
+                    selectedDevice = viewModel.selectedDevice,
+                    onDeviceSelected = { viewModel.selectDevice(it) }
+                )
+                
+                Button(
+                    onClick = { viewModel.connectToSelected() },
+                    modifier = Modifier.fillMaxWidth(),
+                    enabled = viewModel.selectedDevice != null
+                ) {
+                    Text("Connect")
+                }
+            }
+
+            // Start game button
+            if (viewModel.connectionStatus is ConnectionStatus.Connected) {
+                Button(
+                    onClick = { showTurnDialog = true },
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Text("Start Game")
+                }
+            }
+
+            // Game board
+            if (viewModel.player1Id.isNotEmpty()) {
+                GameBoard(
+                    gameState = viewModel.gameState,
+                    isMyTurn = viewModel.isMyTurn,
+                    onCellClick = { row, col -> viewModel.makeMove(row, col) }
+                )
+
+                if (viewModel.gameMessage.isNotEmpty()) {
+                    Text(
+                        text = viewModel.gameMessage,
+                        style = MaterialTheme.typography.headlineSmall,
+                        color = MaterialTheme.colorScheme.primary
+                    )
+                }
+
+                Button(
+                    onClick = { viewModel.resetGame() },
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Text("Reset Game")
+                }
+            }
+        }
+    }
+
+    if (showTurnDialog) {
+        TurnSelectionDialog(
+            onDismiss = { showTurnDialog = false },
+            onSelectTurn = { iGoFirst ->
+                viewModel.claimFirstTurn(iGoFirst)
+                showTurnDialog = false
+            }
+        )
+    }
+}
+
+@Composable
+fun ConnectionStatusCard(status: ConnectionStatus) {
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        colors = CardDefaults.cardColors(
+            containerColor = when (status) {
+                is ConnectionStatus.Connected -> Color(0xFF4CAF50)
+                is ConnectionStatus.Connecting, is ConnectionStatus.Listening -> Color(0xFFFFC107)
+                else -> Color(0xFFE0E0E0)
+            }
+        )
+    ) {
+        Text(
+            text = "Status: ${status.javaClass.simpleName}",
+            modifier = Modifier.padding(16.dp),
+            style = MaterialTheme.typography.titleMedium
+        )
+    }
+}
+
+@Composable
+fun DeviceList(
+    devices: List<BluetoothDevice>,
+    selectedDevice: BluetoothDevice?,
+    onDeviceSelected: (BluetoothDevice) -> Unit
+) {
+    Card(modifier = Modifier.fillMaxWidth()) {
+        LazyColumn(
+            modifier = Modifier
+                .fillMaxWidth()
+                .heightIn(max = 200.dp)
+        ) {
+            items(devices) { device ->
+                val name = try { device.name ?: "Unknown" } catch (e: Exception) { "Unknown" }
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clickable { onDeviceSelected(device) }
+                        .background(if (selectedDevice == device) Color(0xFFE3F2FD) else Color.Transparent)
+                        .padding(12.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(name, style = MaterialTheme.typography.bodyLarge)
+                        Text(device.address, style = MaterialTheme.typography.bodySmall)
+                    }
+                    if (selectedDevice == device) {
+                        Text("✓", color = MaterialTheme.colorScheme.primary)
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+fun GameBoard(
+    gameState: GameState,
+    isMyTurn: Boolean,
+    onCellClick: (Int, Int) -> Unit
+) {
+    Column(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.spacedBy(8.dp)
+    ) {
+        Text(
+            text = if (isMyTurn) "Your Turn" else "Opponent's Turn",
+            style = MaterialTheme.typography.titleMedium
+        )
+        
+        for (row in 0..2) {
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                for (col in 0..2) {
+                    GameCell(
+                        value = gameState.board[row][col],
+                        enabled = isMyTurn && gameState.board[row][col] == " ",
+                        onClick = { onCellClick(row, col) }
+                    )
+                }
+            }
+        }
+    }
+}
+
+@Composable
+fun GameCell(
+    value: String,
+    enabled: Boolean,
+    onClick: () -> Unit
+) {
+    Card(
+        modifier = Modifier
+            .size(80.dp)
+            .clickable(enabled = enabled, onClick = onClick),
+        elevation = CardDefaults.cardElevation(defaultElevation = 4.dp)
+    ) {
+        Box(
+            modifier = Modifier.fillMaxSize(),
+            contentAlignment = Alignment.Center
+        ) {
+            Text(
+                text = value,
+                style = MaterialTheme.typography.displayMedium
+            )
+        }
+    }
+}
+
+@Composable
+fun TurnSelectionDialog(
+    onDismiss: () -> Unit,
+    onSelectTurn: (Boolean) -> Unit
+) {
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Who Goes First?") },
+        text = { Text("Select who will make the first move (X)") },
+        confirmButton = {
+            TextButton(onClick = { onSelectTurn(true) }) {
+                Text("ME")
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = { onSelectTurn(false) }) {
+                Text("OPPONENT")
+            }
+        }
+    )
+}
