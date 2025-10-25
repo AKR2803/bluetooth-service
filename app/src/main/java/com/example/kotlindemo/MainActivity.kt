@@ -165,16 +165,21 @@ class GameViewModel(
     }
 
     fun claimFirstTurn(iGoFirst: Boolean) {
-        player1Id = if (iGoFirst) myDeviceId else opponentId
-        player2Id = if (iGoFirst) opponentId else myDeviceId
-        
-        isMyTurn = (player1Id == myDeviceId)
+        if (iGoFirst) {
+            player1Id = myDeviceId
+            player2Id = opponentId
+            isMyTurn = true
+        } else {
+            player1Id = opponentId
+            player2Id = myDeviceId
+            isMyTurn = false
+        }
         
         val msg = GameMessage(
             gameState = gameState,
             player1Id = player1Id,
             player2Id = player2Id,
-            claimingPlayerId = player1Id
+            claimingPlayerId = "INIT"
         )
         btService.sendMessage(msg.toJson())
     }
@@ -228,23 +233,14 @@ class GameViewModel(
         }
 
         // Initial role assignment
-        if (player1Id.isEmpty() && msg.player1Id.isNotEmpty()) {
+        if (player1Id.isEmpty() && msg.claimingPlayerId == "INIT") {
             player1Id = msg.player1Id
             player2Id = msg.player2Id
             isMyTurn = (myDeviceId == player1Id)
-            
-            // Send confirmation back so both devices sync
-            val confirmMsg = GameMessage(
-                gameState = gameState,
-                player1Id = player1Id,
-                player2Id = player2Id,
-                claimingPlayerId = player1Id
-            )
-            btService.sendMessage(confirmMsg.toJson())
             return
         }
 
-        // Update game state
+        // Update game state from moves
         val oldTurn = gameState.turn
         gameState = msg.gameState
         
@@ -262,18 +258,20 @@ class GameViewModel(
     }
 
     fun resetGame() {
-        val msg = GameMessage(
-            gameState = GameState(isReset = true),
-            player1Id = player1Id,
-            player2Id = player2Id
-        )
-        btService.sendMessage(msg.toJson())
-        
-        // Reset local state
+        // Clear roles completely on reset
+        player1Id = ""
+        player2Id = ""
         gameState = GameState()
         winnerSymbol = ""
         showGameOver = false
-        isMyTurn = (myDeviceId == player1Id)
+        isMyTurn = false
+        
+        val msg = GameMessage(
+            gameState = GameState(isReset = true),
+            player1Id = "",
+            player2Id = ""
+        )
+        btService.sendMessage(msg.toJson())
     }
 
     private fun checkLoser(board: Array<Array<String>>): String? {
