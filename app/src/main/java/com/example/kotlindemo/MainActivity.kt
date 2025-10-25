@@ -218,6 +218,16 @@ class GameViewModel(
     fun handleIncomingMessage(json: String) {
         val msg = GameMessage.fromJson(json) ?: return
 
+        // Handle reset first
+        if (msg.gameState.isReset) {
+            gameState = GameState()
+            winnerSymbol = ""
+            showGameOver = false
+            isMyTurn = (myDeviceId == player1Id)
+            return
+        }
+
+        // Initial role assignment
         if (player1Id.isEmpty() && msg.player1Id.isNotEmpty()) {
             player1Id = msg.player1Id
             player2Id = msg.player2Id
@@ -225,6 +235,7 @@ class GameViewModel(
             return
         }
 
+        // Update game state
         val oldTurn = gameState.turn
         gameState = msg.gameState
         
@@ -239,38 +250,32 @@ class GameViewModel(
                 showGameOver = true
             }
         }
-
-        if (gameState.isReset) {
-            resetGame()
-        }
     }
 
     fun resetGame() {
-        gameState = GameState()
-        winnerSymbol = ""
-        showGameOver = false
-        isMyTurn = (myDeviceId == player1Id)
-        
         val msg = GameMessage(
-            gameState = gameState.copy(isReset = true),
+            gameState = GameState(isReset = true),
             player1Id = player1Id,
             player2Id = player2Id
         )
         btService.sendMessage(msg.toJson())
+        
+        // Reset local state
+        gameState = GameState()
+        winnerSymbol = ""
+        showGameOver = false
+        isMyTurn = (myDeviceId == player1Id)
     }
 
     private fun checkLoser(board: Array<Array<String>>): String? {
-        // Check rows
         for (row in board) {
             if (row[0] != " " && row[0] == row[1] && row[1] == row[2]) return row[0]
         }
-        // Check columns
         for (col in 0..2) {
             if (board[0][col] != " " && board[0][col] == board[1][col] && board[1][col] == board[2][col]) {
                 return board[0][col]
             }
         }
-        // Check diagonals
         if (board[0][0] != " " && board[0][0] == board[1][1] && board[1][1] == board[2][2]) {
             return board[0][0]
         }
@@ -433,7 +438,6 @@ fun GameScreen(
                 }
             }
 
-            // Game Over Overlay
             if (viewModel.showGameOver) {
                 GameOverDialog(
                     isDraw = viewModel.gameState.isDraw,
@@ -661,15 +665,15 @@ fun TurnSelectionDialog(
     AlertDialog(
         onDismissRequest = onDismiss,
         title = { Text("Who Goes First?") },
-        text = { Text("Select who will make the first move (X)") },
+        text = { Text("Choose who will play as X (goes first)") },
         confirmButton = {
             TextButton(onClick = { onSelectTurn(true) }) {
-                Text("ME")
+                Text("ME (I go first)")
             }
         },
         dismissButton = {
             TextButton(onClick = { onSelectTurn(false) }) {
-                Text("OPPONENT")
+                Text("OPPONENT (They go first)")
             }
         }
     )
