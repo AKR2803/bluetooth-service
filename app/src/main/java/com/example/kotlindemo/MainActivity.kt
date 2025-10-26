@@ -7,7 +7,6 @@ import android.bluetooth.BluetoothManager
 import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
-import android.util.Log
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
@@ -131,9 +130,6 @@ class GameViewModel(
     var showGameOver by mutableStateOf(false)
         private set
     
-    var debugLog by mutableStateOf("")
-        private set
-
     private var isHost = false
     private var opponentId = ""
 
@@ -146,14 +142,6 @@ class GameViewModel(
     fun setConnection(isHostDevice: Boolean, remoteAddress: String) {
         isHost = isHostDevice
         opponentId = remoteAddress.takeLast(8)
-        val msg = "Connection: isHost=$isHost, opponentId=$opponentId"
-        Log.d("TicTacToe", "[${myDeviceId}] $msg")
-        addDebugLog(msg)
-    }
-    
-    private fun addDebugLog(msg: String) {
-        debugLog = "${System.currentTimeMillis() % 10000}: $msg\n$debugLog"
-        if (debugLog.length > 1000) debugLog = debugLog.take(1000)
     }
 
     fun loadPairedDevices() {
@@ -177,12 +165,7 @@ class GameViewModel(
     }
 
     fun claimFirstTurn(iGoFirst: Boolean) {
-        addDebugLog("CLAIM: iGoFirst=$iGoFirst, opponentId=$opponentId")
-        
-        if (opponentId.isEmpty()) {
-            addDebugLog("ERROR: opponentId is empty!")
-            return
-        }
+        if (opponentId.isEmpty()) return
         
         if (iGoFirst) {
             player1Id = myDeviceId
@@ -193,8 +176,6 @@ class GameViewModel(
             player2Id = myDeviceId
             isMyTurn = false
         }
-        
-        addDebugLog("RESULT: P1=$player1Id, P2=$player2Id, myTurn=$isMyTurn")
         
         val msg = GameMessage(
             gameState = gameState,
@@ -243,7 +224,6 @@ class GameViewModel(
 
     fun handleIncomingMessage(json: String) {
         val msg = GameMessage.fromJson(json) ?: return
-        addDebugLog("RECEIVED: claimingPlayerId=${msg.claimingPlayerId}")
 
         // Handle reset first
         if (msg.gameState.isReset) {
@@ -253,7 +233,6 @@ class GameViewModel(
             winnerSymbol = ""
             showGameOver = false
             isMyTurn = false
-            addDebugLog("RESET APPLIED")
             return
         }
 
@@ -272,8 +251,6 @@ class GameViewModel(
                 player2Id = myDeviceId
                 isMyTurn = false
             }
-            
-            addDebugLog("ROLES: P1=$player1Id, P2=$player2Id, myDeviceId=$myDeviceId, senderWantsP1=${msg.player1Id != "OPPONENT_SLOT"}, myTurn=$isMyTurn")
             return
         }
 
@@ -485,25 +462,6 @@ fun GameScreen(
                         modifier = Modifier.fillMaxWidth()
                     ) {
                         Text("Reset Game")
-                    }
-                    
-                    // Debug Log Display
-                    Card(
-                        modifier = Modifier.fillMaxWidth(),
-                        colors = CardDefaults.cardColors(containerColor = Color(0xFFE0E0E0))
-                    ) {
-                        Column(modifier = Modifier.padding(8.dp)) {
-                            Text(
-                                "Debug Log:",
-                                style = MaterialTheme.typography.labelSmall,
-                                fontWeight = FontWeight.Bold
-                            )
-                            Text(
-                                viewModel.debugLog.ifEmpty { "No logs yet" },
-                                style = MaterialTheme.typography.bodySmall,
-                                modifier = Modifier.heightIn(max = 100.dp)
-                            )
-                        }
                     }
                 }
             }
