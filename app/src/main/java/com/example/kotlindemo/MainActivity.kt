@@ -262,8 +262,9 @@ class GameViewModel(
             player1Id = msg.player1Id
             player2Id = msg.player2Id
             val amIPlayer1 = (myDeviceId == player1Id)
+            // Player 1 always goes first (turn 0), so if I'm Player 1, it's my turn
             isMyTurn = amIPlayer1
-            addDebugLog("ROLES: P1=$player1Id, P2=$player2Id, amIPlayer1=$amIPlayer1, myTurn=$isMyTurn")
+            addDebugLog("ROLES: P1=$player1Id, P2=$player2Id, myDeviceId=$myDeviceId, amIPlayer1=$amIPlayer1, myTurn=$isMyTurn")
             return
         }
 
