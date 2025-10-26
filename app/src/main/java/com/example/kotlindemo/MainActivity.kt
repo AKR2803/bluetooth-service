@@ -7,6 +7,7 @@ import android.bluetooth.BluetoothManager
 import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
+import android.util.Log
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
@@ -142,6 +143,7 @@ class GameViewModel(
     fun setConnection(isHostDevice: Boolean, remoteAddress: String) {
         isHost = isHostDevice
         opponentId = remoteAddress.takeLast(8)
+        Log.d("TicTacToe", "Connection set: isHost=$isHost, myId=$myDeviceId, opponentId=$opponentId")
     }
 
     fun loadPairedDevices() {
@@ -165,6 +167,8 @@ class GameViewModel(
     }
 
     fun claimFirstTurn(iGoFirst: Boolean) {
+        Log.d("TicTacToe", "claimFirstTurn: iGoFirst=$iGoFirst, myId=$myDeviceId, opponentId=$opponentId")
+        
         if (iGoFirst) {
             player1Id = myDeviceId
             player2Id = opponentId
@@ -174,6 +178,8 @@ class GameViewModel(
             player2Id = myDeviceId
             isMyTurn = false
         }
+        
+        Log.d("TicTacToe", "After claim: player1Id=$player1Id, player2Id=$player2Id, isMyTurn=$isMyTurn")
         
         val msg = GameMessage(
             gameState = gameState,
@@ -222,13 +228,17 @@ class GameViewModel(
 
     fun handleIncomingMessage(json: String) {
         val msg = GameMessage.fromJson(json) ?: return
+        Log.d("TicTacToe", "Received message: ${msg.claimingPlayerId}")
 
         // Handle reset first
         if (msg.gameState.isReset) {
+            player1Id = ""
+            player2Id = ""
             gameState = GameState()
             winnerSymbol = ""
             showGameOver = false
-            isMyTurn = (myDeviceId == player1Id)
+            isMyTurn = false
+            Log.d("TicTacToe", "Reset received")
             return
         }
 
@@ -237,6 +247,7 @@ class GameViewModel(
             player1Id = msg.player1Id
             player2Id = msg.player2Id
             isMyTurn = (myDeviceId == player1Id)
+            Log.d("TicTacToe", "Roles received: player1Id=$player1Id, player2Id=$player2Id, isMyTurn=$isMyTurn")
             return
         }
 
