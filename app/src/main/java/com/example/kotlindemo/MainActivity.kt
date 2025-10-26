@@ -130,6 +130,9 @@ class GameViewModel(
     
     var showGameOver by mutableStateOf(false)
         private set
+    
+    var debugLog by mutableStateOf("")
+        private set
 
     private var isHost = false
     private var opponentId = ""
@@ -143,7 +146,14 @@ class GameViewModel(
     fun setConnection(isHostDevice: Boolean, remoteAddress: String) {
         isHost = isHostDevice
         opponentId = remoteAddress.takeLast(8)
-        Log.d("TicTacToe", "Connection set: isHost=$isHost, myId=$myDeviceId, opponentId=$opponentId")
+        val msg = "Connection: isHost=$isHost, opponentId=$opponentId"
+        Log.d("TicTacToe", "[${myDeviceId}] $msg")
+        addDebugLog(msg)
+    }
+    
+    private fun addDebugLog(msg: String) {
+        debugLog = "${System.currentTimeMillis() % 10000}: $msg\n$debugLog"
+        if (debugLog.length > 1000) debugLog = debugLog.take(1000)
     }
 
     fun loadPairedDevices() {
@@ -167,7 +177,12 @@ class GameViewModel(
     }
 
     fun claimFirstTurn(iGoFirst: Boolean) {
-        Log.d("TicTacToe", "claimFirstTurn: iGoFirst=$iGoFirst, myId=$myDeviceId, opponentId=$opponentId")
+        addDebugLog("CLAIM: iGoFirst=$iGoFirst, opponentId=$opponentId")
+        
+        if (opponentId.isEmpty()) {
+            addDebugLog("ERROR: opponentId is empty!")
+            return
+        }
         
         if (iGoFirst) {
             player1Id = myDeviceId
@@ -179,7 +194,7 @@ class GameViewModel(
             isMyTurn = false
         }
         
-        Log.d("TicTacToe", "After claim: player1Id=$player1Id, player2Id=$player2Id, isMyTurn=$isMyTurn")
+        addDebugLog("RESULT: P1=$player1Id, P2=$player2Id, myTurn=$isMyTurn")
         
         val msg = GameMessage(
             gameState = gameState,
@@ -228,7 +243,7 @@ class GameViewModel(
 
     fun handleIncomingMessage(json: String) {
         val msg = GameMessage.fromJson(json) ?: return
-        Log.d("TicTacToe", "Received message: ${msg.claimingPlayerId}")
+        addDebugLog("RECEIVED: claimingPlayerId=${msg.claimingPlayerId}")
 
         // Handle reset first
         if (msg.gameState.isReset) {
@@ -238,7 +253,7 @@ class GameViewModel(
             winnerSymbol = ""
             showGameOver = false
             isMyTurn = false
-            Log.d("TicTacToe", "Reset received")
+            addDebugLog("RESET APPLIED")
             return
         }
 
@@ -246,8 +261,9 @@ class GameViewModel(
         if (player1Id.isEmpty() && msg.claimingPlayerId == "INIT") {
             player1Id = msg.player1Id
             player2Id = msg.player2Id
-            isMyTurn = (myDeviceId == player1Id)
-            Log.d("TicTacToe", "Roles received: player1Id=$player1Id, player2Id=$player2Id, isMyTurn=$isMyTurn")
+            val amIPlayer1 = (myDeviceId == player1Id)
+            isMyTurn = amIPlayer1
+            addDebugLog("ROLES: P1=$player1Id, P2=$player2Id, amIPlayer1=$amIPlayer1, myTurn=$isMyTurn")
             return
         }
 
@@ -314,6 +330,8 @@ class GameViewModel(
         val winnerId = if (winnerSymbol == "X") player1Id else player2Id
         return if (winnerId == myDeviceId) "You" else "Opponent"
     }
+    
+    fun getOpponentId(): String = opponentId.ifEmpty { "Not Set" }
 }
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -344,6 +362,11 @@ fun GameScreen(
                             "My ID: ${viewModel.myDeviceId}",
                             color = Color.White,
                             style = MaterialTheme.typography.titleMedium
+                        )
+                        Text(
+                            "Opponent ID: ${viewModel.getOpponentId()}",
+                            color = Color.White,
+                            style = MaterialTheme.typography.bodySmall
                         )
                         if (viewModel.player1Id.isNotEmpty()) {
                             Text(
@@ -452,6 +475,25 @@ fun GameScreen(
                         modifier = Modifier.fillMaxWidth()
                     ) {
                         Text("Reset Game")
+                    }
+                    
+                    // Debug Log Display
+                    Card(
+                        modifier = Modifier.fillMaxWidth(),
+                        colors = CardDefaults.cardColors(containerColor = Color(0xFFE0E0E0))
+                    ) {
+                        Column(modifier = Modifier.padding(8.dp)) {
+                            Text(
+                                "Debug Log:",
+                                style = MaterialTheme.typography.labelSmall,
+                                fontWeight = FontWeight.Bold
+                            )
+                            Text(
+                                viewModel.debugLog.ifEmpty { "No logs yet" },
+                                style = MaterialTheme.typography.bodySmall,
+                                modifier = Modifier.heightIn(max = 100.dp)
+                            )
+                        }
                     }
                 }
             }
