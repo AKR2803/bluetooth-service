@@ -16,6 +16,9 @@ import com.example.kotlindemo.BluetoothService
 import android.bluetooth.BluetoothManager
 
 class MainActivity : ComponentActivity() {
+    private lateinit var bluetoothService: BluetoothService
+    private lateinit var bluetoothViewModel: GameViewModel
+    
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContent {
@@ -38,12 +41,14 @@ class MainActivity : ComponentActivity() {
                             GameScreen(navController, "local")
                         }
                         composable("game/bluetooth") {
-                            val bluetoothAdapter = (getSystemService(BLUETOOTH_SERVICE) as BluetoothManager).adapter
-                            val bluetoothService = BluetoothService(this@MainActivity, bluetoothAdapter)
-                            val gameViewModel = GameViewModel(bluetoothService)
+                            if (!::bluetoothService.isInitialized) {
+                                val bluetoothAdapter = (getSystemService(BLUETOOTH_SERVICE) as BluetoothManager).adapter
+                                bluetoothService = BluetoothService(this@MainActivity, bluetoothAdapter)
+                                bluetoothViewModel = GameViewModel(bluetoothService)
+                            }
                             
                             BluetoothGameScreen(
-                                viewModel = gameViewModel,
+                                viewModel = bluetoothViewModel,
                                 onRequestPermissions = {
                                     if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.S) {
                                         requestPermissions(
@@ -65,6 +70,13 @@ class MainActivity : ComponentActivity() {
                     }
                 }
             }
+        }
+    }
+    
+    override fun onDestroy() {
+        super.onDestroy()
+        if (::bluetoothService.isInitialized) {
+            bluetoothService.cleanup()
         }
     }
 }
