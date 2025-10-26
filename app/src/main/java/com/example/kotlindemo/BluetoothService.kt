@@ -10,6 +10,10 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import java.io.IOException
 import java.util.*
+import kotlin.io.bufferedReader
+import kotlin.io.use
+import kotlin.let
+import kotlin.text.toByteArray
 
 private val SPP_UUID: UUID = UUID.fromString("00001101-0000-1000-8000-00805F9B34FB")
 
@@ -23,7 +27,7 @@ sealed class ConnectionStatus {
 
 class BluetoothService(
     private val context: Context,
-    private val adapter: BluetoothAdapter
+    val adapter: BluetoothAdapter
 ) {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
