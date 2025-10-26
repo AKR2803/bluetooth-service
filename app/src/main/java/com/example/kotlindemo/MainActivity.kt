@@ -186,10 +186,10 @@ class GameViewModel(
         
         if (iGoFirst) {
             player1Id = myDeviceId
-            player2Id = opponentId
+            player2Id = "WAITING_FOR_OPPONENT_ID"
             isMyTurn = true
         } else {
-            player1Id = opponentId
+            player1Id = "WAITING_FOR_OPPONENT_ID"
             player2Id = myDeviceId
             isMyTurn = false
         }
@@ -198,9 +198,9 @@ class GameViewModel(
         
         val msg = GameMessage(
             gameState = gameState,
-            player1Id = player1Id,
-            player2Id = player2Id,
-            claimingPlayerId = "INIT"
+            player1Id = if (iGoFirst) myDeviceId else "OPPONENT_SLOT",
+            player2Id = if (iGoFirst) "OPPONENT_SLOT" else myDeviceId,
+            claimingPlayerId = myDeviceId
         )
         btService.sendMessage(msg.toJson())
     }
@@ -257,14 +257,23 @@ class GameViewModel(
             return
         }
 
-        // Initial role assignment
-        if (player1Id.isEmpty() && msg.claimingPlayerId == "INIT") {
-            player1Id = msg.player1Id
-            player2Id = msg.player2Id
-            val amIPlayer1 = (myDeviceId == player1Id)
-            // Player 1 always goes first (turn 0), so if I'm Player 1, it's my turn
-            isMyTurn = amIPlayer1
-            addDebugLog("ROLES: P1=$player1Id, P2=$player2Id, myDeviceId=$myDeviceId, amIPlayer1=$amIPlayer1, myTurn=$isMyTurn")
+        // Initial role assignment - exchange device IDs
+        if (player1Id.isEmpty() && msg.claimingPlayerId != "INIT") {
+            val senderDeviceId = msg.claimingPlayerId
+            
+            if (msg.player1Id == "OPPONENT_SLOT") {
+                // Sender wants to be Player 2, I become Player 1
+                player1Id = myDeviceId
+                player2Id = senderDeviceId
+                isMyTurn = true
+            } else {
+                // Sender wants to be Player 1, I become Player 2  
+                player1Id = senderDeviceId
+                player2Id = myDeviceId
+                isMyTurn = false
+            }
+            
+            addDebugLog("ROLES: P1=$player1Id, P2=$player2Id, myDeviceId=$myDeviceId, senderWantsP1=${msg.player1Id != "OPPONENT_SLOT"}, myTurn=$isMyTurn")
             return
         }
 
