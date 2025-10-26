@@ -14,6 +14,9 @@ import com.example.kotlindemo.GameScreen as BluetoothGameScreen
 import com.example.kotlindemo.GameViewModel
 import com.example.kotlindemo.BluetoothService
 import android.bluetooth.BluetoothManager
+import androidx.lifecycle.lifecycleScope
+import kotlinx.coroutines.flow.collectLatest
+import kotlinx.coroutines.launch
 
 class MainActivity : ComponentActivity() {
     private lateinit var bluetoothService: BluetoothService
@@ -45,6 +48,23 @@ class MainActivity : ComponentActivity() {
                                 val bluetoothAdapter = (getSystemService(BLUETOOTH_SERVICE) as BluetoothManager).adapter
                                 bluetoothService = BluetoothService(this@MainActivity, bluetoothAdapter)
                                 bluetoothViewModel = GameViewModel(bluetoothService)
+                                
+                                lifecycleScope.launch {
+                                    bluetoothService.incomingMessages.collectLatest { msg ->
+                                        msg?.let { bluetoothViewModel.handleIncomingMessage(it) }
+                                    }
+                                }
+                                
+                                lifecycleScope.launch {
+                                    bluetoothService.status.collectLatest { status ->
+                                        when (status) {
+                                            is com.example.kotlindemo.ConnectionStatus.Connected -> {
+                                                bluetoothViewModel.setConnection(status.isHost, status.remoteAddress)
+                                            }
+                                            else -> {}
+                                        }
+                                    }
+                                }
                             }
                             
                             BluetoothGameScreen(
