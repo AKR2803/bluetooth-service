@@ -306,19 +306,11 @@ class GameViewModel(
         return null
     }
     
-    fun getCurrentTurnPlayerId(): String {
-        if (player1Id.isEmpty()) return ""
-        val shouldBePlayer1Turn = (gameState.turn % 2 == 0)
-        return if (shouldBePlayer1Turn) player1Id else player2Id
-    }
-    
     fun getWinnerName(): String {
         if (winnerSymbol.isEmpty()) return ""
         val winnerId = if (winnerSymbol == "X") player1Id else player2Id
         return if (winnerId == myDeviceId) "You" else "Opponent"
     }
-    
-    fun getOpponentId(): String = opponentId.ifEmpty { "Not Set" }
 }
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -346,27 +338,15 @@ fun GameScreen(
                 ) {
                     Column(modifier = Modifier.padding(12.dp)) {
                         Text(
-                            "My ID: ${viewModel.myDeviceId}",
+                            "Misère Tic-Tac-Toe",
                             color = Color.White,
                             style = MaterialTheme.typography.titleMedium
                         )
                         Text(
-                            "Opponent ID: ${viewModel.getOpponentId()}",
+                            "Don't make 3 in a row - you'll lose!",
                             color = Color.White,
                             style = MaterialTheme.typography.bodySmall
                         )
-                        if (viewModel.player1Id.isNotEmpty()) {
-                            Text(
-                                "Player 1 (X): ${viewModel.player1Id}",
-                                color = Color.White,
-                                style = MaterialTheme.typography.bodySmall
-                            )
-                            Text(
-                                "Player 2 (O): ${viewModel.player2Id}",
-                                color = Color.White,
-                                style = MaterialTheme.typography.bodySmall
-                            )
-                        }
                     }
                 }
 
@@ -443,18 +423,13 @@ fun GameScreen(
                             containerColor = if (viewModel.isMyTurn) Color(0xFF4CAF50) else Color(0xFFF44336)
                         )
                     ) {
-                        Column(modifier = Modifier.padding(12.dp)) {
-                            Text(
-                                "Current Turn: ${viewModel.getCurrentTurnPlayerId()}",
-                                color = Color.White,
-                                style = MaterialTheme.typography.titleMedium
-                            )
-                            Text(
-                                if (viewModel.isMyTurn) "YOUR TURN" else "OPPONENT'S TURN",
-                                color = Color.White,
-                                style = MaterialTheme.typography.bodyLarge
-                            )
-                        }
+                        Text(
+                            if (viewModel.isMyTurn) "YOUR TURN" else "OPPONENT'S TURN",
+                            modifier = Modifier.padding(16.dp),
+                            color = Color.White,
+                            style = MaterialTheme.typography.titleLarge,
+                            textAlign = TextAlign.Center
+                        )
                     }
 
                     Button(
